@@ -37,6 +37,11 @@ $envFile = Join-Path $scriptDir '.env'
 $logFile = Join-Path $scriptDir 'logs\bridge.log'
 $venvPython = Join-Path $scriptDir '.venv\Scripts\python.exe'
 
+$validator = Join-Path $scriptDir 'validate_bridge_response.ps1'
+if (-not (Test-Path -LiteralPath $validator)) {
+    throw "Missing response validator: $validator"
+}
+. $validator
 if (-not (Test-Path -LiteralPath $serverScript)) {
     throw "Missing server script: $serverScript"
 }
@@ -52,6 +57,7 @@ if (-not (Test-Path -LiteralPath $envFile)) {
 if (-not (Test-Path -LiteralPath $venvPython)) {
     throw "Missing virtualenv python: $venvPython"
 }
+
 
 $config = Read-DotEnv -Path $envFile
 $localHost = if ($config['BRIDGE_HOST'] -eq '0.0.0.0') { '127.0.0.1' } else { $config['BRIDGE_HOST'] }
@@ -81,6 +87,35 @@ for ($attempt = 1; $attempt -le 10; $attempt++) {
     }
 }
 
+$sync = $null
+$syncValid = $false
+$syncError = $null
+if ($null -ne $health) {
+    try {
+        $syncBody = @{
+            server = $config['MT5_SERVER']
+            accountLogin = [int64]$config['MT5_LOGIN']
+            password = $config['MT5_PASSWORD']
+        } | ConvertTo-Json
+        $sync = Invoke-RestMethod `
+            -Uri "http://${localHost}:${port}/sync" `
+            -Headers $headers `
+            -Method Post `
+            -ContentType 'application/json' `
+            -Body $syncBody `
+            -TimeoutSec 30
+        Assert-BridgeV2Response `
+            -Sync $sync `
+            -ExpectedServer $config['MT5_SERVER'] `
+            -ExpectedLogin ([int64]$config['MT5_LOGIN'])
+        $syncValid = $true
+    } catch {
+        $syncError = $_.Exception.Message
+        $sync = $null
+        $syncValid = $false
+    }
+}
+
 [pscustomobject]@{
     TaskName = $task.TaskName
     TaskState = $task.State
@@ -94,6 +129,11 @@ for ($attempt = 1; $attempt -le 10; $attempt++) {
     InitialFrom = if ($null -ne $health) { $health.initial_from } else { $null }
     AccountLogin = if ($null -ne $health) { $health.account.login } else { $null }
     HealthUrl = $healthUrl
+    SyncOk = $syncValid
+    SyncError = $syncError
+    SyncDealCount = if ($null -ne $sync) { @($sync.deals).Count } else { $null }
+    SyncOrderCount = if ($null -ne $sync) { @($sync.orders).Count } else { $null }
+    PositionBalanceCount = if ($null -ne $sync) { @($sync.positionBalances).Count } else { $null }
 }
 
 Write-Host '--- matching processes ---'
@@ -116,6 +156,24 @@ if ($null -ne $health) {
     $health | ConvertTo-Json -Depth 10
 } else {
     Write-Host $healthError
+}
+
+Write-Host '--- sync v2 summary ---'
+if ($syncValid) {
+    [pscustomobject]@{
+        Server = $sync.server
+        AccountLogin = $sync.accountLogin
+        DealCount = @($sync.deals).Count
+        OrderCount = @($sync.orders).Count
+        PositionBalanceCount = @($sync.positionBalances).Count
+        CursorPresent = -not [string]::IsNullOrWhiteSpace($sync.cursor)
+    }
+} else {
+    Write-Host $syncError
+}
+
+if ($null -eq $health -or -not $syncValid) {
+    exit 1
 }
 
 
