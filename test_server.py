@@ -74,6 +74,15 @@ class BridgeV3Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid or expired cursor"):
             server._decode_cursor(cursor, "different-secret")
 
+        legacy_payload = json.dumps(
+            {"v": 2, "d": deals_digest, "o": orders_digest},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        legacy_signature = server.hmac.new(b"secret", legacy_payload, server.hashlib.sha256).digest()
+        legacy_cursor = server.base64.urlsafe_b64encode(legacy_payload + legacy_signature).decode("ascii").rstrip("=")
+        self.assertEqual(server._decode_cursor(legacy_cursor, "secret"), ("", ""))
+
     def test_private_proof_schema_binds_approved_digests(self) -> None:
         payload = {
             "formatVersion": 1, "evidenceSha256": server.APPROVED_EVIDENCE_SHA256,

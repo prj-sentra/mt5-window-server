@@ -320,8 +320,9 @@ def _decode_cursor(raw: Any, token: str) -> tuple[str, str]:
         if not hmac.compare_digest(supplied, expected):
             raise ValueError
         decoded = json.loads(payload.decode("utf-8"))
+        version = decoded.get("v")
         if (
-            decoded.get("v") != CURSOR_VERSION
+            version not in {2, CURSOR_VERSION}
             or not isinstance(decoded.get("d"), str)
             or not isinstance(decoded.get("o"), str)
             or any(
@@ -330,6 +331,8 @@ def _decode_cursor(raw: Any, token: str) -> tuple[str, str]:
             )
         ):
             raise ValueError
+        if version == 2:
+            return "", ""
         return decoded["d"], decoded["o"]
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ValueError("invalid or expired cursor") from exc
