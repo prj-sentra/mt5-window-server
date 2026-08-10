@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import functools
 import json
 import logging
 import os
@@ -10,9 +11,11 @@ import sys
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 from typing import Any
 
 import MetaTrader5 as mt5
@@ -61,7 +64,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("mt5-bridge-server")
 
 MT5_LOCK = threading.RLock()
-CURSOR_VERSION = 2
+CURSOR_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +77,139 @@ class BridgeConfig:
     bridge_host: str
     bridge_port: int
     bridge_token: str
+    entry_balance_proof: EntryBalanceProof
 
+@dataclass(frozen=True, slots=True)
+class EntryBalanceProof:
+    format_version: int
+    evidence_sha256: str
+    statement_report_sha256: str
+    server: str
+    account_login: int
+    currency: str
+    baseline_balance: Decimal
+    baseline_deal_ticket: int
+    approval_timestamp: datetime
+    ledger_semantics_version: int
+    currency_scale: int
+    rounding_mode: str
+    deal_type_buy: int
+    deal_type_sell: int
+    deal_type_balance: int
+    deal_entry_in: int
+    deal_entry_inout: int
+
+
+def _decimal_string(value: Any) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid decimal value") from exc
+    if not result.is_finite():
+        raise ValueError("decimal values must be finite")
+    return result
+
+
+def _proof_decimal_string(value: Any) -> Decimal:
+    if not isinstance(value, str) or not value:
+        raise ValueError("proof decimals must be non-empty strings")
+    if value.startswith("+") or "e" in value.lower():
+        raise ValueError("proof decimals must not use signs or exponent notation")
+    if re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d*[1-9])?", value) is None:
+        raise ValueError("proof decimals must be canonical")
+    try:
+        result = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("invalid decimal value in proof") from exc
+    if not result.is_finite() or result.is_zero() and value.startswith("-"):
+        raise ValueError("proof decimals must be finite non-negative zero values")
+    _, digits, exponent = result.as_tuple()
+    fractional_digits = max(-exponent, 0)
+    integer_digits = len(digits) - fractional_digits
+    if fractional_digits > 30 or integer_digits > 35 or len(digits) > 65:
+        raise ValueError("proof decimal exceeds DECIMAL(65,30)")
+    return result
+
+
+APPROVED_EVIDENCE_SHA256 = "0c0540daa9e45b190001f739651e1b203298e767bf8efbac6836f4314e255d29"
+APPROVED_REPORT_SHA256 = "065519e97cc495924b9780d59aac312524d6deb16b2000828f2eb1b3fd35a237"
+USD_SCALE = 2
+USD_ROUNDING = "ROUND_HALF_UP"
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _load_entry_balance_proof(path: Path) -> EntryBalanceProof:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("entry-balance proof file is unreadable") from exc
+    required_fields = {
+        "formatVersion", "evidenceSha256", "statementReportSha256", "server", "accountLogin",
+        "currency", "baselineBalance", "baselineDealTicket", "approvalTimestamp",
+        "ledgerSemanticsVersion", "currencyScale", "roundingMode", "dealTypeBuy", "dealTypeSell",
+        "dealTypeBalance", "dealEntryIn", "dealEntryInOut",
+    }
+    if not isinstance(raw, dict) or set(raw) != required_fields:
+        raise RuntimeError("entry-balance proof has an invalid schema")
+    try:
+        proof = EntryBalanceProof(
+            format_version=raw["formatVersion"],
+            evidence_sha256=raw["evidenceSha256"],
+            statement_report_sha256=raw["statementReportSha256"],
+            server=raw["server"],
+            account_login=raw["accountLogin"],
+            currency=raw["currency"],
+            baseline_balance=_proof_decimal_string(raw["baselineBalance"]),
+            baseline_deal_ticket=raw["baselineDealTicket"],
+            approval_timestamp=_parse_iso8601(raw["approvalTimestamp"]),
+            ledger_semantics_version=raw["ledgerSemanticsVersion"],
+            currency_scale=raw["currencyScale"],
+            rounding_mode=raw["roundingMode"],
+            deal_type_buy=raw["dealTypeBuy"],
+            deal_type_sell=raw["dealTypeSell"],
+            deal_type_balance=raw["dealTypeBalance"],
+            deal_entry_in=raw["dealEntryIn"],
+            deal_entry_inout=raw["dealEntryInOut"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("entry-balance proof has invalid values") from exc
+    runtime_constants = {
+        "deal_type_buy": mt5.DEAL_TYPE_BUY,
+        "deal_type_sell": mt5.DEAL_TYPE_SELL,
+        "deal_type_balance": mt5.DEAL_TYPE_BALANCE,
+        "deal_entry_in": mt5.DEAL_ENTRY_IN,
+        "deal_entry_inout": mt5.DEAL_ENTRY_INOUT,
+    }
+    if (
+        proof.format_version != 1
+        or not _is_sha256(proof.evidence_sha256)
+        or proof.evidence_sha256 != APPROVED_EVIDENCE_SHA256
+        or not _is_sha256(proof.statement_report_sha256)
+        or proof.statement_report_sha256 != APPROVED_REPORT_SHA256
+        or not isinstance(proof.server, str) or not proof.server or proof.server != proof.server.strip()
+        or not isinstance(proof.account_login, int) or isinstance(proof.account_login, bool) or proof.account_login <= 0
+        or proof.currency != "USD"
+        or proof.ledger_semantics_version != 1
+        or proof.currency_scale != USD_SCALE
+        or proof.rounding_mode != USD_ROUNDING
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value != runtime_constants[name]
+            for name, value in (
+                ("deal_type_buy", proof.deal_type_buy),
+                ("deal_type_sell", proof.deal_type_sell),
+                ("deal_type_balance", proof.deal_type_balance),
+                ("deal_entry_in", proof.deal_entry_in),
+                ("deal_entry_inout", proof.deal_entry_inout),
+            )
+        )
+        or not isinstance(proof.baseline_deal_ticket, int) or isinstance(proof.baseline_deal_ticket, bool)
+        or proof.baseline_deal_ticket <= 0
+    ):
+        raise RuntimeError("entry-balance proof has invalid values")
+    return proof
 
 def _serialize(value: Any) -> Any:
     if isinstance(value, datetime):
@@ -100,6 +235,7 @@ def _require_env(name: str) -> str:
     return value
 
 
+@functools.lru_cache(maxsize=1)
 def _get_config() -> BridgeConfig:
     return BridgeConfig(
         mt5_terminal=_require_env("MT5_TERMINAL"),
@@ -110,6 +246,7 @@ def _get_config() -> BridgeConfig:
         bridge_host=_require_env("BRIDGE_HOST"),
         bridge_port=int(_require_env("BRIDGE_PORT")),
         bridge_token=_require_env("BRIDGE_TOKEN"),
+        entry_balance_proof=_load_entry_balance_proof(Path(_require_env("MT5_ENTRY_BALANCE_PROOF_FILE"))),
     )
 
 
@@ -236,29 +373,148 @@ def _serialize_order(order: Any) -> dict[str, Any]:
     }
 
 
-def _deal_balance_delta(deal: Any) -> float:
-    credit_type = int(getattr(mt5, "DEAL_TYPE_CREDIT", 3))
-    if int(deal.type) == credit_type:
-        return 0.0
-    return float(deal.profit) + float(deal.commission) + float(deal.swap) + float(deal.fee)
+def _deal_balance_delta(deal: Any) -> Decimal:
+    return sum(
+        (_decimal_string(getattr(deal, field)) for field in ("profit", "commission", "swap", "fee")),
+        Decimal("0"),
+    )
 
 
-def _build_position_balances(deals: list[Any], current_balance: float) -> list[dict[str, Any]]:
-    ordered = sorted(deals, key=_deal_key)
-    running_balance = current_balance - sum(_deal_balance_delta(deal) for deal in ordered)
-    balances: dict[str, float] = {}
-    for deal in ordered:
+def _canonical_decimal(value: Decimal) -> str:
+    if value.is_zero():
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _is_execution_deal(deal: Any) -> bool:
+    return int(deal.type) in {
+        int(getattr(mt5, "DEAL_TYPE_BUY", 0)),
+        int(getattr(mt5, "DEAL_TYPE_SELL", 1)),
+    }
+
+
+def _opening_deal(deals: list[Any]) -> Any | None:
+    return next(
+        (
+            deal for deal in deals
+            if _is_execution_deal(deal) and int(deal.entry) == int(getattr(mt5, "DEAL_ENTRY_IN", 0))
+        ),
+        None,
+    )
+
+
+def _anchored_assertion(deal: Any, reason: str) -> dict[str, Any]:
+    return {
+        "kind": "ANCHORED",
+        "positionId": _as_int_string(deal.position_id),
+        "entryDealTicket": _as_int_string(deal.ticket),
+        "entryOrderTicket": _as_int_string(deal.order),
+        "entryTimeMsc": int(deal.time_msc),
+        "reason": reason,
+        "ledgerSemanticsVersion": 1,
+    }
+
+
+def _build_position_entry_assertions(
+    deals: list[Any], account: Any, server: str, account_login: int, proof: EntryBalanceProof | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    by_position: dict[str, list[Any]] = {}
+    for deal in sorted(deals, key=_deal_key):
         position_id = _as_int_string(deal.position_id)
-        if position_id != "0" and int(deal.entry) in {0, 2} and position_id not in balances:
-            balances[position_id] = running_balance
-        running_balance += _deal_balance_delta(deal)
+        if position_id != "0":
+            by_position.setdefault(position_id, []).append(deal)
 
-    if abs(running_balance - current_balance) > 0.01:
-        raise RuntimeError("could not reconcile MT5 account balance history")
-    return [
-        {"positionId": position_id, "preEntryBalance": round(balance, 10)}
-        for position_id, balance in balances.items()
-    ]
+    unsupported: list[dict[str, Any]] = []
+    openings: dict[str, Any] = {}
+    for position_id, position_deals in by_position.items():
+        opening = _opening_deal(position_deals)
+        if opening is None:
+            unsupported.append({
+                "kind": "UNANCHORED", "positionId": position_id,
+                "reason": "OPENING_DEAL_OUTSIDE_HISTORY", "ledgerSemanticsVersion": 1,
+            })
+        else:
+            openings[position_id] = opening
+
+    proof_reason: str | None = None
+    if proof is None:
+        proof_reason = "UNSUPPORTED_ACCOUNT_NOT_APPROVED"
+    elif proof.server != server or proof.account_login != account_login or str(getattr(account, "currency", "")) != proof.currency:
+        proof_reason = "UNSUPPORTED_ACCOUNT_NOT_APPROVED"
+
+    running_balance: Decimal | None = None
+    if proof_reason is None:
+        baseline_index = next(
+            (index for index, deal in enumerate(sorted(deals, key=_deal_key)) if int(deal.ticket) == proof.baseline_deal_ticket),
+            None,
+        )
+        ordered = sorted(deals, key=_deal_key)
+        balance_type = int(getattr(mt5, "DEAL_TYPE_BALANCE", 2))
+        supported_types = {
+            int(getattr(mt5, "DEAL_TYPE_BUY", 0)),
+            int(getattr(mt5, "DEAL_TYPE_SELL", 1)),
+            balance_type,
+        }
+        if baseline_index is None or int(ordered[baseline_index].type) != balance_type:
+            proof_reason = "UNSUPPORTED_CHECKPOINT"
+        else:
+            running_balance = proof.baseline_balance.quantize(
+                Decimal(1).scaleb(-proof.currency_scale), rounding=proof.rounding_mode,
+            )
+            for deal in ordered[baseline_index + 1:]:
+                if int(deal.type) not in supported_types:
+                    proof_reason = "UNSUPPORTED_CHECKPOINT"
+                    break
+                running_balance = (running_balance + _deal_balance_delta(deal)).quantize(
+                    Decimal(1).scaleb(-proof.currency_scale), rounding=proof.rounding_mode,
+                )
+            if proof_reason is None and running_balance != _decimal_string(account.balance).quantize(
+                Decimal(1).scaleb(-proof.currency_scale), rounding=proof.rounding_mode,
+            ):
+                proof_reason = "UNSUPPORTED_CHECKPOINT"
+
+    proven: list[dict[str, Any]] = []
+    if proof_reason is None:
+        assert proof is not None
+        assert running_balance is not None
+        ordered = sorted(deals, key=_deal_key)
+        baseline_index = next(index for index, deal in enumerate(ordered) if int(deal.ticket) == proof.baseline_deal_ticket)
+        balance = proof.baseline_balance.quantize(
+            Decimal(1).scaleb(-proof.currency_scale), rounding=proof.rounding_mode,
+        )
+        balances_before: dict[int, Decimal] = {}
+        for deal in ordered[baseline_index + 1:]:
+            balances_before[int(deal.ticket)] = balance
+            balance = (balance + _deal_balance_delta(deal)).quantize(
+                Decimal(1).scaleb(-proof.currency_scale), rounding=proof.rounding_mode,
+            )
+        for position_id, opening in openings.items():
+            if any(int(deal.entry) == int(getattr(mt5, "DEAL_ENTRY_INOUT", 2)) for deal in by_position[position_id]):
+                unsupported.append(_anchored_assertion(opening, "UNSUPPORTED_INOUT"))
+            elif int(opening.ticket) not in balances_before:
+                unsupported.append(_anchored_assertion(opening, "UNSUPPORTED_CHECKPOINT"))
+            else:
+                proven.append({
+                    "positionId": position_id,
+                    "entryDealTicket": _as_int_string(opening.ticket),
+                    "entryOrderTicket": _as_int_string(opening.order),
+                    "entryTimeMsc": int(opening.time_msc),
+                    "preEntryBalance": _canonical_decimal(balances_before[int(opening.ticket)]),
+                    "ledgerSemanticsVersion": proof.ledger_semantics_version,
+                })
+    else:
+        unsupported.extend(
+            _anchored_assertion(
+                opening,
+                "UNSUPPORTED_INOUT" if any(
+                    int(deal.entry) == int(getattr(mt5, "DEAL_ENTRY_INOUT", 2))
+                    for deal in by_position[position_id]
+                ) else proof_reason,
+            )
+            for position_id, opening in openings.items()
+        )
+
+    return proven, unsupported
 
 
 def _login_for_sync(server: str, account_login: int, password: str) -> None:
@@ -433,6 +689,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             payload.get("cursor"),
             config.bridge_token,
         )
+        proof = config.entry_balance_proof
         with MT5_LOCK:
             _login_for_sync(server, account_login, password)
             now = datetime.now(UTC)
@@ -454,19 +711,24 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             orders_digest = _facts_digest(serialized_orders)
             changed_deals = [] if deals_digest == previous_deals_digest else serialized_deals
             changed_orders = [] if orders_digest == previous_orders_digest else serialized_orders
-            position_balances = _build_position_balances(deals, float(account.balance))
+            position_entry_balances, unsupported_position_entry_balances = _build_position_entry_assertions(
+                deals, account, server, account_login, proof,
+            )
 
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "server": server,
-                "accountLogin": account_login,
-                "cursor": _encode_cursor(deals_digest, orders_digest, config.bridge_token),
-                "deals": changed_deals,
-                "orders": changed_orders,
-                "positionBalances": position_balances,
-            },
-        )
+        response = {
+            "contractVersion": 3,
+            "server": server,
+            "accountLogin": account_login,
+            "cursor": _encode_cursor(deals_digest, orders_digest, config.bridge_token),
+            "ledgerSemanticsVersion": 1,
+            "deals": changed_deals,
+            "orders": changed_orders,
+            "positionEntryBalances": position_entry_balances,
+            "unsupportedPositionEntryBalances": unsupported_position_entry_balances,
+        }
+        if len(json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024 * 1024:
+            raise RuntimeError("bridge v3 response exceeds 1 MiB")
+        self._send_json(HTTPStatus.OK, response)
     def _handle_profit_calc(self) -> None:
         _ensure_connected()
         payload = self._read_json_body()

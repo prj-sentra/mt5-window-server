@@ -104,7 +104,7 @@ if ($null -ne $health) {
             -ContentType 'application/json' `
             -Body $syncBody `
             -TimeoutSec 30
-        Assert-BridgeV2Response `
+        Assert-BridgeV3Response `
             -Sync $sync `
             -ExpectedServer $config['MT5_SERVER'] `
             -ExpectedLogin ([int64]$config['MT5_LOGIN'])
@@ -133,7 +133,8 @@ if ($null -ne $health) {
     SyncError = $syncError
     SyncDealCount = if ($null -ne $sync) { @($sync.deals).Count } else { $null }
     SyncOrderCount = if ($null -ne $sync) { @($sync.orders).Count } else { $null }
-    PositionBalanceCount = if ($null -ne $sync) { @($sync.positionBalances).Count } else { $null }
+    ProvenPositionEntryBalanceCount = if ($null -ne $sync) { @($sync.positionEntryBalances).Count } else { $null }
+    UnsupportedPositionEntryBalanceCount = if ($null -ne $sync) { @($sync.unsupportedPositionEntryBalances).Count } else { $null }
 }
 
 Write-Host '--- matching processes ---'
@@ -146,26 +147,26 @@ if ($null -ne $listener) {
     Write-Host "No listener on port $port"
 }
 
-if (Test-Path -LiteralPath $logFile) {
-    Write-Host '--- bridge.log (tail 80) ---'
-    Get-Content -LiteralPath $logFile -Tail 80
-}
-
-Write-Host '--- health response ---'
+Write-Host '--- health summary ---'
 if ($null -ne $health) {
-    $health | ConvertTo-Json -Depth 10
+    [pscustomobject]@{
+        Ok = $health.ok
+        InitialFrom = $health.initial_from
+        AccountLogin = $health.account.login
+    }
 } else {
     Write-Host $healthError
 }
 
-Write-Host '--- sync v2 summary ---'
+Write-Host '--- sync v3 summary ---'
 if ($syncValid) {
     [pscustomobject]@{
         Server = $sync.server
         AccountLogin = $sync.accountLogin
         DealCount = @($sync.deals).Count
         OrderCount = @($sync.orders).Count
-        PositionBalanceCount = @($sync.positionBalances).Count
+        ProvenPositionEntryBalanceCount = @($sync.positionEntryBalances).Count
+        UnsupportedPositionEntryBalanceCount = @($sync.unsupportedPositionEntryBalances).Count
         CursorPresent = -not [string]::IsNullOrWhiteSpace($sync.cursor)
     }
 } else {

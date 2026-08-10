@@ -1,0 +1,19 @@
+{
+  "formatVersion": 1,
+  "evidenceSha256": "669ee92e631afa7412d0af993d11dee2ff1d08cf8212975e24623396fc216e31",
+  "statementReportSha256": "065519e97cc495924b9780d59aac312524d6deb16b2000828f2eb1b3fd35a237",
+  "server": "Broker-MT5",
+  "accountLogin": 123456789,
+  "currency": "USD",
+  "baselineBalance": "10000",
+  "baselineDealTicket": 1234567890,
+  "approvalTimestamp": "2026-01-01T00:00:00Z",
+  "ledgerSemanticsVersion": 1,
+  "currencyScale": 2,
+  "roundingMode": "ROUND_HALF_UP",
+  "dealTypeBuy": 0,
+  "dealTypeSell": 1,
+  "dealTypeBalance": 2,
+  "dealEntryIn": 0,
+  "dealEntryInOut": 2
+}
