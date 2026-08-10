@@ -96,6 +96,7 @@ if ($null -ne $health) {
             server = $config['MT5_SERVER']
             accountLogin = [int64]$config['MT5_LOGIN']
             password = $config['MT5_PASSWORD']
+            historyToMsc = [DateTimeOffset]::UtcNow.AddHours(24).ToUnixTimeMilliseconds()
         } | ConvertTo-Json
         $sync = Invoke-RestMethod `
             -Uri "http://${localHost}:${port}/sync" `
