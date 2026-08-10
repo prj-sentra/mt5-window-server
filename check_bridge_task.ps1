@@ -96,6 +96,7 @@ if ($null -ne $health) {
             server = $config['MT5_SERVER']
             accountLogin = [int64]$config['MT5_LOGIN']
             password = $config['MT5_PASSWORD']
+            historyFromMsc = 0
             historyToMsc = [DateTimeOffset]::UtcNow.AddHours(24).ToUnixTimeMilliseconds()
         } | ConvertTo-Json
         $sync = Invoke-RestMethod `
@@ -105,7 +106,7 @@ if ($null -ne $health) {
             -ContentType 'application/json' `
             -Body $syncBody `
             -TimeoutSec 30
-        Assert-BridgeV3Response `
+        Assert-BridgeV4Response `
             -Sync $sync `
             -ExpectedServer $config['MT5_SERVER'] `
             -ExpectedLogin ([int64]$config['MT5_LOGIN'])
@@ -134,8 +135,8 @@ if ($null -ne $health) {
     SyncError = $syncError
     SyncDealCount = if ($null -ne $sync) { @($sync.deals).Count } else { $null }
     SyncOrderCount = if ($null -ne $sync) { @($sync.orders).Count } else { $null }
-    ProvenPositionEntryBalanceCount = if ($null -ne $sync) { @($sync.positionEntryBalances).Count } else { $null }
-    UnsupportedPositionEntryBalanceCount = if ($null -ne $sync) { @($sync.unsupportedPositionEntryBalances).Count } else { $null }
+    SyncCurrency = if ($null -ne $sync) { $sync.account.currency } else { $null }
+    SyncCurrentBalance = if ($null -ne $sync) { $sync.account.currentBalance } else { $null }
 }
 
 Write-Host '--- matching processes ---'
@@ -159,15 +160,15 @@ if ($null -ne $health) {
     Write-Host $healthError
 }
 
-Write-Host '--- sync v3 summary ---'
+Write-Host '--- sync v4 summary ---'
 if ($syncValid) {
     [pscustomobject]@{
         Server = $sync.server
         AccountLogin = $sync.accountLogin
         DealCount = @($sync.deals).Count
         OrderCount = @($sync.orders).Count
-        ProvenPositionEntryBalanceCount = @($sync.positionEntryBalances).Count
-        UnsupportedPositionEntryBalanceCount = @($sync.unsupportedPositionEntryBalances).Count
+        Currency = $sync.account.currency
+        CurrentBalance = $sync.account.currentBalance
         CursorPresent = -not [string]::IsNullOrWhiteSpace($sync.cursor)
     }
 } else {
