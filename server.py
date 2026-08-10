@@ -77,7 +77,7 @@ class BridgeConfig:
     bridge_host: str
     bridge_port: int
     bridge_token: str
-    entry_balance_proof: EntryBalanceProof
+    entry_balance_proof: EntryBalanceProof | None
 
 @dataclass(frozen=True, slots=True)
 class EntryBalanceProof:
@@ -244,6 +244,13 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _optional_entry_balance_proof() -> EntryBalanceProof | None:
+    raw_path = os.getenv("MT5_ENTRY_BALANCE_PROOF_FILE", "").strip()
+    if not raw_path:
+        return None
+    return _load_entry_balance_proof(Path(raw_path))
+
+
 @functools.lru_cache(maxsize=1)
 def _get_config() -> BridgeConfig:
     return BridgeConfig(
@@ -255,7 +262,7 @@ def _get_config() -> BridgeConfig:
         bridge_host=_require_env("BRIDGE_HOST"),
         bridge_port=int(_require_env("BRIDGE_PORT")),
         bridge_token=_require_env("BRIDGE_TOKEN"),
-        entry_balance_proof=_load_entry_balance_proof(Path(_require_env("MT5_ENTRY_BALANCE_PROOF_FILE"))),
+        entry_balance_proof=_optional_entry_balance_proof(),
     )
 
 

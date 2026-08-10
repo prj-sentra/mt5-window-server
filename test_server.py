@@ -136,6 +136,14 @@ class BridgeV3Tests(unittest.TestCase):
                 self.assertEqual(config.entry_balance_proof.evidence_sha256, server.APPROVED_EVIDENCE_SHA256)
                 server._get_config.cache_clear()
 
+    def test_config_allows_account_without_entry_balance_proof(self) -> None:
+        with mock.patch.dict(os.environ, {"MT5_ENTRY_BALANCE_PROOF_FILE": ""}):
+            server._get_config.cache_clear()
+            try:
+                self.assertIsNone(server._get_config().entry_balance_proof)
+            finally:
+                server._get_config.cache_clear()
+
     def test_main_uses_config_owned_proof_without_reloading_path(self) -> None:
         config = mock.Mock(bridge_host="127.0.0.1", bridge_port=18813, mt5_initial_from=server.datetime(2020, 1, 1, tzinfo=server.UTC))
         http_server = mock.Mock()
