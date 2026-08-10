@@ -29,7 +29,7 @@ Order = namedtuple(
     "Order",
     "ticket position_id time_setup time_setup_msc time_done time_done_msc type state reason volume_initial volume_current price_open sl tp price_current price_stoplimit symbol comment external_id",
 )
-Account = namedtuple("Account", "login balance currency")
+Account = namedtuple("Account", "login balance currency currency_digits", defaults=(2,))
 
 
 
@@ -89,6 +89,9 @@ class BridgeV4Tests(unittest.TestCase):
         self.assertEqual(server._canonical_number(111.25), "111.25")
         with self.assertRaisesRegex(RuntimeError, "balance is invalid"):
             server._canonical_number(float("nan"))
+        self.assertEqual(server._currency_digits(Account(1, 100, 'USD', 2)), 2)
+        with self.assertRaisesRegex(RuntimeError, 'currency digits are invalid'):
+            server._currency_digits(Account(1, 100, 'USD', 9))
 
     def test_fact_digest_detects_historical_mutation(self) -> None:
         original = [{"ticket": "1", "type": 0, "profit": 10.0}]
@@ -178,6 +181,7 @@ class BridgeV4Tests(unittest.TestCase):
                 self.assertEqual(body["account"], {
                     "currency": "USD",
                     "currentBalance": "111",
+                    "currencyDigits": 2,
                 })
                 self.assertEqual(
                     body["cursor"],

@@ -16,9 +16,10 @@ function Assert-BridgeV4Response {
     Assert-FiniteNumber $Sync.historyRange.fromMsc 'historyRange.fromMsc'
     Assert-FiniteNumber $Sync.historyRange.toMsc 'historyRange.toMsc'
     if ([int64]$Sync.historyRange.fromMsc -lt 0 -or [int64]$Sync.historyRange.toMsc -lt [int64]$Sync.historyRange.fromMsc) { throw 'Bridge v4 history range is invalid' }
-    Assert-RequiredProperties $Sync.account @('currency','currentBalance') 'account'
+    Assert-RequiredProperties $Sync.account @('currency','currentBalance','currencyDigits') 'account'
     if ($Sync.account.currency -isnot [string] -or [string]::IsNullOrWhiteSpace($Sync.account.currency)) { throw 'Bridge v4 account currency is invalid' }
     Assert-CanonicalDecimal $Sync.account.currentBalance 'account.currentBalance'
+    if ($Sync.account.currencyDigits -isnot [int] -or $Sync.account.currencyDigits -lt 0 -or $Sync.account.currencyDigits -gt 8) { throw 'Bridge v4 account currency digits are invalid' }
     Assert-BridgeArray $Sync.deals 'deals'; Assert-BridgeArray $Sync.orders 'orders'
     foreach ($deal in $Sync.deals) {
         Assert-RequiredProperties $deal @('ticket','order','positionId','timeMsc','entry','profit','commission','swap','fee') 'deal'

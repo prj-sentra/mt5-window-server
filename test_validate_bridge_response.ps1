@@ -8,7 +8,7 @@ function New-ValidResponse {
         accountLogin = 12345
         cursor = 'opaque'
         historyRange = [pscustomobject]@{ fromMsc=0; toMsc=1760000000000 }
-        account = [pscustomobject]@{ currency='USD'; currentBalance='10000.12' }
+        account = [pscustomobject]@{ currency='USD'; currentBalance='10000.12'; currencyDigits=2 }
         deals = @([pscustomobject]@{ ticket='9001'; order='8001'; positionId='5001'; timeMsc=1760000000000; entry=0; profit=0.0; commission=-1.0; swap=0.0; fee=0.0 })
         orders = @()
     }

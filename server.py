@@ -97,6 +97,11 @@ def _canonical_number(value: Any) -> str:
         return "0"
     return format(number.normalize(), "f")
 
+def _currency_digits(account: Any) -> int:
+    value = getattr(account, "currency_digits", None)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 8:
+        raise RuntimeError("MT5 account currency digits are invalid")
+    return value
 
 def _parse_iso8601(raw: str) -> datetime:
     value = datetime.fromisoformat(raw)
@@ -467,6 +472,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             "account": {
                 "currency": str(account.currency or ""),
                 "currentBalance": _canonical_number(account.balance),
+                "currencyDigits": _currency_digits(account),
             },
             "deals": changed_deals,
             "orders": changed_orders,
