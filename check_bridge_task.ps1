@@ -112,7 +112,11 @@ if ($null -ne $health) {
             -ExpectedLogin ([int64]$config['MT5_LOGIN'])
         $syncValid = $true
     } catch {
-        $syncError = $_.Exception.Message
+        $syncError = if ($_.ErrorDetails.Message) {
+            $_.ErrorDetails.Message
+        } else {
+            $_.Exception.Message
+        }
         $sync = $null
         $syncValid = $false
     }
