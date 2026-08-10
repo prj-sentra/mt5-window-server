@@ -19,7 +19,9 @@ function Assert-BridgeV4Response {
     Assert-RequiredProperties $Sync.account @('currency','currentBalance','currencyDigits') 'account'
     if ($Sync.account.currency -isnot [string] -or [string]::IsNullOrWhiteSpace($Sync.account.currency)) { throw 'Bridge v4 account currency is invalid' }
     Assert-CanonicalDecimal $Sync.account.currentBalance 'account.currentBalance'
-    if ($Sync.account.currencyDigits -isnot [int] -or $Sync.account.currencyDigits -lt 0 -or $Sync.account.currencyDigits -gt 8) { throw 'Bridge v4 account currency digits are invalid' }
+    Assert-FiniteNumber $Sync.account.currencyDigits 'account.currencyDigits'
+    $currencyDigits = [double]$Sync.account.currencyDigits
+    if ($currencyDigits -ne [Math]::Truncate($currencyDigits) -or $currencyDigits -lt 0 -or $currencyDigits -gt 8) { throw 'Bridge v4 account currency digits are invalid' }
     Assert-BridgeArray $Sync.deals 'deals'; Assert-BridgeArray $Sync.orders 'orders'
     foreach ($deal in $Sync.deals) {
         Assert-RequiredProperties $deal @('ticket','order','positionId','timeMsc','entry','profit','commission','swap','fee') 'deal'

@@ -20,5 +20,7 @@ Assert-Fails { $r=New-ValidResponse; $r.contractVersion=3; Assert-BridgeV4Respon
 Assert-Fails { $r=New-ValidResponse; $r.server='Other'; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'identity mismatch'
 Assert-Fails { $r=New-ValidResponse; $r.historyRange.fromMsc=1760000000001; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'reversed history range'
 Assert-Fails { $r=New-ValidResponse; $r.account.currentBalance='1e4'; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'noncanonical balance'
+Assert-Passes { $r=New-ValidResponse; $r.account.currencyDigits=[int64]2; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'Int64 currency digits'
+Assert-Fails { $r=New-ValidResponse; $r.account.currencyDigits=2.5; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'fractional currency digits'
 Assert-Fails { $r=New-ValidResponse; $r.deals[0].ticket=9001; Assert-BridgeV4Response $r 'Broker-Server' 12345 } 'numeric deal identifier'
 Write-Host 'All bridge response validation tests passed.'
