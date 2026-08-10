@@ -112,8 +112,16 @@ if ($null -ne $health) {
             -ExpectedLogin ([int64]$config['MT5_LOGIN'])
         $syncValid = $true
     } catch {
-        $syncError = if ($_.ErrorDetails.Message) {
-            $_.ErrorDetails.Message
+        $errorDetailsMessage = if (
+            $null -ne $_.ErrorDetails -and
+            $null -ne $_.ErrorDetails.PSObject.Properties['Message']
+        ) {
+            [string]$_.ErrorDetails.Message
+        } else {
+            ''
+        }
+        $syncError = if (-not [string]::IsNullOrWhiteSpace($errorDetailsMessage)) {
+            $errorDetailsMessage
         } else {
             $_.Exception.Message
         }
