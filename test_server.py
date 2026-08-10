@@ -205,6 +205,16 @@ class BridgeV3Tests(unittest.TestCase):
         self.assertEqual(server._serialize_deal(deal)["externalId"], "e")
         self.assertEqual(server._serialize_order(order)["priceStopLimit"], 0.0)
         self.assertEqual(server._order_key(order), (7, 1))
+
+    def test_history_to_datetime_requires_positive_epoch_milliseconds(self) -> None:
+        self.assertEqual(
+            server._history_to_datetime(1_765_411_845_123),
+            server.datetime(2025, 12, 11, 0, 10, 45, 123000, tzinfo=server.UTC),
+        )
+        for invalid in (None, True, 0, -1, 1.5, "1765411845123"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "historyToMsc"):
+                    server._history_to_datetime(invalid)
     def test_sync_replays_each_digest_stream_independently(self) -> None:
         deals = [
             Deal(1, 1, 50, 1, 1000, 0, 0, 0, 0, 1.0, 100.0, -1.0, 0.0, 12.0, 0.0, "X", "", ""),
@@ -235,6 +245,7 @@ class BridgeV3Tests(unittest.TestCase):
                     "accountLogin": 1,
                     "password": "password",
                     "cursor": cursor,
+                    "historyToMsc": 1_765_411_845_123,
                 }
                 response: list[tuple[object, dict[str, object]]] = []
                 handler._send_json = lambda status, body: response.append((status, body))
@@ -255,6 +266,13 @@ class BridgeV3Tests(unittest.TestCase):
                     mock.patch.object(server.mt5, "account_info", return_value=Account(1, 111.0, "USD"), create=True),
                 ):
                     handler._handle_sync()
+                    expected_history_to = server.datetime(2025, 12, 11, 0, 10, 45, 123000, tzinfo=server.UTC)
+                    server.mt5.history_deals_get.assert_called_once_with(
+                        server.datetime(2020, 1, 1, tzinfo=server.UTC), expected_history_to,
+                    )
+                    server.mt5.history_orders_get.assert_called_once_with(
+                        server.datetime(2020, 1, 1, tzinfo=server.UTC), expected_history_to,
+                    )
 
                 login.assert_called_once_with("Broker-Server", 1, "password")
                 status, body = response[0]

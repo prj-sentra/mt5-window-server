@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -226,6 +226,15 @@ def _parse_iso8601(raw: str) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _history_to_datetime(raw: Any) -> datetime:
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        raise ValueError("'historyToMsc' must be a positive integer")
+    try:
+        return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=raw)
+    except OverflowError as exc:
+        raise ValueError("'historyToMsc' is outside the supported range") from exc
 
 
 def _require_env(name: str) -> str:
@@ -692,9 +701,11 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         proof = config.entry_balance_proof
         with MT5_LOCK:
             _login_for_sync(server, account_login, password)
-            now = datetime.now(UTC)
-            all_deals = mt5.history_deals_get(config.mt5_initial_from, now)
-            all_orders = mt5.history_orders_get(config.mt5_initial_from, now)
+            history_to = _history_to_datetime(payload.get("historyToMsc"))
+            if history_to < config.mt5_initial_from:
+                raise ValueError("'historyToMsc' must not precede MT5_INITIAL_FROM")
+            all_deals = mt5.history_deals_get(config.mt5_initial_from, history_to)
+            all_orders = mt5.history_orders_get(config.mt5_initial_from, history_to)
             account = mt5.account_info()
             if all_deals is None:
                 raise RuntimeError(f"mt5.history_deals_get() failed: {mt5.last_error()}")
