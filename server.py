@@ -121,6 +121,13 @@ def _canonical_positive_number(value: Any, field: str) -> str:
     return number
 
 
+def _tick_field(tick: Any, field: str) -> Any:
+    try:
+        return tick[field]
+    except (IndexError, KeyError, TypeError):
+        return getattr(tick, field)
+
+
 def _tick_snapshot_digest(ticks: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     digest.update(b"\x00\x00\x00\x11ticks-v1-snapshot")
@@ -679,11 +686,13 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 valuation = _symbol_valuation(symbol, account)
                 rows = []
                 for source_index, tick in enumerate(source):
-                    time_msc = int(tick.time_msc)
+                    # MetaTrader5 returns a NumPy structured array. Individual
+                    # rows are numpy.void values and require field indexing.
+                    time_msc = int(_tick_field(tick, "time_msc"))
                     if from_msc <= time_msc <= to_msc:
                         try:
-                            bid = _canonical_positive_number(tick.bid, "bid")
-                            ask = _canonical_positive_number(tick.ask, "ask")
+                            bid = _canonical_positive_number(_tick_field(tick, "bid"), "bid")
+                            ask = _canonical_positive_number(_tick_field(tick, "ask"), "ask")
                         except ValueError:
                             continue
                         rows.append((time_msc, source_index, bid, ask))
