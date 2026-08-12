@@ -80,6 +80,22 @@ TICK_CURSOR_NAMESPACE = "ticks-v1"
 TICK_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TICK_CACHE_BYTES = 0
 TICK_CACHE_LOCK = threading.RLock()
+SUPPORTED_CALCULATION_MODES = (
+    ("SYMBOL_CALC_MODE_FOREX", 0, "FOREX"),
+    ("SYMBOL_CALC_MODE_FUTURES", 2, "FUTURES"),
+    ("SYMBOL_CALC_MODE_CFD", 1, "CFD"),
+    ("SYMBOL_CALC_MODE_CFDINDEX", 3, "CFDINDEX"),
+    ("SYMBOL_CALC_MODE_CFDLEVERAGE", 4, "CFDLEVERAGE"),
+    ("SYMBOL_CALC_MODE_EXCH_STOCKS", 32, "EXCH_STOCKS"),
+    ("SYMBOL_CALC_MODE_EXCH_FUTURES", 33, "EXCH_FUTURES"),
+    ("SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS", 34, "EXCH_FUTURES_FORTS"),
+    ("SYMBOL_CALC_MODE_EXCH_BONDS", 35, "EXCH_BONDS"),
+    ("SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX", 36, "EXCH_STOCKS_MOEX"),
+    ("SYMBOL_CALC_MODE_EXCH_BONDS_MOEX", 37, "EXCH_BONDS_MOEX"),
+    ("SYMBOL_CALC_MODE_SERV_COLLATERAL", 64, "SERV_COLLATERAL"),
+    ("SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", 10, "FOREX_NO_LEVERAGE"),
+)
+SUPPORTED_CALCULATION_MODE_NAMES = tuple(mode for _, _, mode in SUPPORTED_CALCULATION_MODES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,19 +175,8 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
     if info is None:
         raise RuntimeError("tick_valuation_unsupported")
     mode_by_value = {
-        getattr(mt5, "SYMBOL_CALC_MODE_FOREX", 0): "FOREX",
-        getattr(mt5, "SYMBOL_CALC_MODE_FUTURES", 2): "FUTURES",
-        getattr(mt5, "SYMBOL_CALC_MODE_CFD", 1): "CFD",
-        getattr(mt5, "SYMBOL_CALC_MODE_CFDINDEX", 3): "CFDINDEX",
-        getattr(mt5, "SYMBOL_CALC_MODE_CFDLEVERAGE", 4): "CFDLEVERAGE",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_STOCKS", 32): "EXCH_STOCKS",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_FUTURES", 33): "EXCH_FUTURES",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS", 34): "EXCH_FUTURES_FORTS",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_BONDS", 35): "EXCH_BONDS",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX", 36): "EXCH_STOCKS_MOEX",
-        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_BONDS_MOEX", 37): "EXCH_BONDS_MOEX",
-        getattr(mt5, "SYMBOL_CALC_MODE_SERV_COLLATERAL", 64): "SERV_COLLATERAL",
-        getattr(mt5, "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", 10): "FOREX_NO_LEVERAGE",
+        getattr(mt5, constant, default): mode
+        for constant, default, mode in SUPPORTED_CALCULATION_MODES
     }
     calculation_mode = mode_by_value.get(getattr(info, "trade_calc_mode", None))
     if calculation_mode is None:
@@ -634,7 +639,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 "cacheMaxEntries": TICK_CACHE_MAX_ENTRIES,
                 "cacheMaxBytes": TICK_CACHE_MAX_BYTES,
                 "valuationVersion": 1,
-                "supportedCalculationModes": ["FOREX", "FOREX_NO_LEVERAGE"],
+                "supportedCalculationModes": list(SUPPORTED_CALCULATION_MODE_NAMES),
             },
         })
 

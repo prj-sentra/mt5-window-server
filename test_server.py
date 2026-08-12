@@ -228,6 +228,8 @@ class BridgeV5Tests(unittest.TestCase):
         self.assertEqual(body["ticks"]["cursorNamespace"], "ticks-v1")
         self.assertEqual(body["ticks"]["maxChunkSpanMsc"], 300000)
         self.assertLess(body["ticks"]["maxResponseBytes"], 1024 * 1024)
+        self.assertEqual(body["ticks"]["supportedCalculationModes"], list(server.SUPPORTED_CALCULATION_MODE_NAMES))
+        self.assertIn("CFDLEVERAGE", body["ticks"]["supportedCalculationModes"])
 
     def test_tick_pages_are_immutable_request_bound_and_cursor_isolated(self):
         Tick = namedtuple("Tick", "time_msc bid ask")
