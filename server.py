@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import functools
 import json
@@ -8,6 +9,9 @@ import logging
 import os
 import sys
 import threading
+import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -65,6 +69,16 @@ MT5_LOCK = threading.RLock()
 CURSOR_VERSION = 5
 SYNC_RESPONSE_TARGET_BYTES = 768 * 1024
 SYNC_RESPONSE_MAX_BYTES = 1024 * 1024
+TICK_RESPONSE_MAX_BYTES = 900_000
+TICK_MAX_CHUNK_MSC = 300_000
+TICK_MAX_PAGE_SIZE = 1_000
+TICK_MAX_SNAPSHOT_TICKS = 20_000
+TICK_SNAPSHOT_TTL_SECONDS = 60
+TICK_CACHE_MAX_ENTRIES = 8
+TICK_CACHE_MAX_BYTES = 6_000_000
+TICK_CURSOR_NAMESPACE = "ticks-v1"
+TICK_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+TICK_CACHE_BYTES = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +111,90 @@ def _canonical_number(value: Any) -> str:
     if number.is_zero():
         return "0"
     return format(number.normalize(), "f")
+
+
+def _canonical_positive_number(value: Any, field: str) -> str:
+    number = _canonical_number(value)
+    if Decimal(number) <= 0:
+        raise ValueError(f"'{field}' must be positive and finite")
+    return number
+
+
+def _tick_snapshot_digest(ticks: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"\x00\x00\x00\x11ticks-v1-snapshot")
+    digest.update(len(ticks).to_bytes(8, "big"))
+    for tick in ticks:
+        digest.update(tick["sequence"].to_bytes(8, "big"))
+        digest.update(tick["timeMsc"].to_bytes(8, "big"))
+        for field in ("bid", "ask"):
+            encoded = tick[field].encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _encode_tick_cursor(snapshot: dict[str, Any], next_sequence: int, token: str) -> str:
+    payload = json.dumps({
+        "kind": TICK_CURSOR_NAMESPACE, "v": CURSOR_VERSION,
+        "snapshotId": snapshot["id"], "snapshotSha256": snapshot["sha256"],
+        "server": snapshot["server"], "accountLogin": snapshot["accountLogin"],
+        "symbol": snapshot["symbol"], "rawRange": snapshot["rawRange"],
+        "snapshotToMsc": snapshot["snapshotToMsc"], "pageSize": snapshot["pageSize"],
+        "expiresAtMsc": snapshot["expiresAtMsc"], "nextSequence": next_sequence,
+    }, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature = hmac.new(token.encode("utf-8"), payload, "sha256").digest()
+    return base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
+
+
+def _decode_tick_cursor(raw: Any, token: str) -> tuple[dict[str, Any], int]:
+    if not isinstance(raw, str) or not raw or len(raw) > 2_048:
+        raise ValueError("invalid_or_expired_tick_cursor")
+    try:
+        signed = base64.urlsafe_b64decode((raw + "=" * (-len(raw) % 4)).encode("ascii"))
+        payload, supplied = signed[:-32], signed[-32:]
+        if not hmac.compare_digest(supplied, hmac.new(token.encode("utf-8"), payload, "sha256").digest()):
+            raise ValueError
+        decoded = json.loads(payload)
+        if decoded.get("kind") != TICK_CURSOR_NAMESPACE or decoded.get("v") != CURSOR_VERSION:
+            raise ValueError
+        snapshot = TICK_CACHE.get(decoded["snapshotId"])
+        if (
+            snapshot is None or snapshot["expiresAtMsc"] <= int(time.time() * 1_000)
+            or decoded["snapshotSha256"] != snapshot["sha256"]
+            or any(decoded[key] != snapshot[key] for key in (
+                "server", "accountLogin", "symbol", "rawRange", "snapshotToMsc", "pageSize", "expiresAtMsc"
+            ))
+            or not isinstance(decoded["nextSequence"], int)
+            or decoded["nextSequence"] < 0
+        ):
+            raise ValueError
+        TICK_CACHE.move_to_end(snapshot["id"])
+        return snapshot, decoded["nextSequence"]
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_or_expired_tick_cursor") from exc
+
+
+def _expire_tick_cache() -> None:
+    global TICK_CACHE_BYTES
+    now = int(time.time() * 1_000)
+    for key in [key for key, value in TICK_CACHE.items() if value["expiresAtMsc"] <= now]:
+        TICK_CACHE_BYTES -= TICK_CACHE.pop(key)["bytes"]
+
+
+def _admit_tick_snapshot(snapshot: dict[str, Any]) -> None:
+    global TICK_CACHE_BYTES
+    _expire_tick_cache()
+    while TICK_CACHE and (
+        len(TICK_CACHE) >= TICK_CACHE_MAX_ENTRIES
+        or TICK_CACHE_BYTES + snapshot["bytes"] > TICK_CACHE_MAX_BYTES
+    ):
+        _, evicted = TICK_CACHE.popitem(last=False)
+        TICK_CACHE_BYTES -= evicted["bytes"]
+    if snapshot["bytes"] > TICK_CACHE_MAX_BYTES:
+        raise RuntimeError("tick_snapshot_capacity")
+    TICK_CACHE[snapshot["id"]] = snapshot
+    TICK_CACHE_BYTES += snapshot["bytes"]
 
 def _currency_digits(account: Any) -> int:
     value = getattr(account, "currency_digits", None)
@@ -355,6 +453,9 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             if self.path == "/health":
                 self._handle_health()
                 return
+            if self.path == "/capabilities":
+                self._handle_capabilities()
+                return
             if self.path == "/api/account":
                 self._handle_account()
                 return
@@ -369,6 +470,9 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/sync":
                 self._handle_sync()
+                return
+            if self.path == "/ticks":
+                self._handle_ticks()
                 return
             if self.path == "/api/history/deals":
                 self._handle_history_deals()
@@ -425,6 +529,118 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         if account_info is None:
             raise RuntimeError(f"mt5.account_info() failed: {mt5.last_error()}")
         self._send_json(HTTPStatus.OK, _serialize(account_info))
+
+    def _handle_capabilities(self) -> None:
+        self._send_json(HTTPStatus.OK, {
+            "contractVersion": CURSOR_VERSION,
+            "sync": {"bootstrap": True, "incremental": True, "fixedSnapshot": True},
+            "ticks": {
+                "available": True, "cursorNamespace": TICK_CURSOR_NAMESPACE,
+                "maxRequestBytes": 8_192, "maxCursorChars": 2_048,
+                "pageSize": {"min": 1, "max": TICK_MAX_PAGE_SIZE},
+                "maxResponseBytes": TICK_RESPONSE_MAX_BYTES,
+                "maxChunkSpanMsc": TICK_MAX_CHUNK_MSC,
+                "maxChunkTicks": TICK_MAX_SNAPSHOT_TICKS,
+                "maxSnapshotBytes": 750_000,
+                "snapshotTtlSeconds": TICK_SNAPSHOT_TTL_SECONDS,
+                "cacheMaxEntries": TICK_CACHE_MAX_ENTRIES,
+                "cacheMaxBytes": TICK_CACHE_MAX_BYTES,
+                "valuationVersion": 1,
+                "supportedCalculationModes": ["FOREX", "FOREX_NO_LEVERAGE"],
+            },
+        })
+
+    def _handle_ticks(self) -> None:
+        payload = self._read_json_body()
+        config = _get_config()
+        if payload.get("contractVersion") != CURSOR_VERSION:
+            raise ValueError("'contractVersion' must be 5")
+        cursor = payload.get("pageCursor")
+        if cursor:
+            snapshot, offset = _decode_tick_cursor(cursor, config.bridge_token)
+        else:
+            server = payload.get("server")
+            account_login = payload.get("accountLogin")
+            password = payload.get("password")
+            symbol = payload.get("symbol")
+            raw_range = payload.get("rawRange")
+            snapshot_to_msc = payload.get("snapshotToMsc")
+            page_size = payload.get("pageSize", TICK_MAX_PAGE_SIZE)
+            if not isinstance(server, str) or not server.strip() or server != server.strip():
+                raise ValueError("'server' must be a non-empty exact string")
+            if not isinstance(account_login, int) or isinstance(account_login, bool) or account_login <= 0:
+                raise ValueError("'accountLogin' must be a positive integer")
+            if not isinstance(password, str) or not password:
+                raise ValueError("'password' must be a non-empty string")
+            if not isinstance(symbol, str) or not symbol.strip() or symbol != symbol.strip():
+                raise ValueError("'symbol' must be a non-empty exact string")
+            if not isinstance(raw_range, dict):
+                raise ValueError("'rawRange' must be an object")
+            from_msc, to_msc = raw_range.get("fromMsc"), raw_range.get("toMsc")
+            _history_datetime(from_msc, "rawRange.fromMsc", allow_zero=True)
+            raw_to = _history_datetime(to_msc, "rawRange.toMsc", allow_zero=True)
+            _history_datetime(snapshot_to_msc, "snapshotToMsc")
+            if from_msc > to_msc or to_msc > snapshot_to_msc or to_msc - from_msc > TICK_MAX_CHUNK_MSC:
+                raise ValueError("'rawRange' is outside the supported snapshot")
+            if not isinstance(page_size, int) or isinstance(page_size, bool) or not 1 <= page_size <= TICK_MAX_PAGE_SIZE:
+                raise ValueError("'pageSize' is outside the supported range")
+            with MT5_LOCK:
+                _login_for_sync(server, account_login, password)
+                source = mt5.copy_ticks_range(
+                    symbol, _history_datetime(from_msc, "rawRange.fromMsc", allow_zero=True),
+                    raw_to, mt5.COPY_TICKS_ALL,
+                )
+                if source is None:
+                    raise RuntimeError(f"mt5.copy_ticks_range() failed: {mt5.last_error()}")
+                rows = []
+                for source_index, tick in enumerate(source):
+                    time_msc = int(tick.time_msc)
+                    if from_msc <= time_msc <= to_msc:
+                        try:
+                            bid = _canonical_positive_number(tick.bid, "bid")
+                            ask = _canonical_positive_number(tick.ask, "ask")
+                        except ValueError:
+                            continue
+                        rows.append((time_msc, source_index, bid, ask))
+            rows.sort(key=lambda row: (row[0], row[1]))
+            if len(rows) > TICK_MAX_SNAPSHOT_TICKS:
+                raise RuntimeError("tick_source_limit")
+            ticks = [
+                {"sequence": sequence, "timeMsc": row[0], "bid": row[2], "ask": row[3]}
+                for sequence, row in enumerate(rows)
+            ]
+            snapshot = {
+                "id": uuid.uuid4().hex, "server": server, "accountLogin": account_login,
+                "symbol": symbol, "rawRange": {"fromMsc": from_msc, "toMsc": to_msc},
+                "snapshotToMsc": snapshot_to_msc, "pageSize": page_size, "ticks": ticks,
+                "sha256": _tick_snapshot_digest(ticks),
+                "expiresAtMsc": int(time.time() * 1_000) + TICK_SNAPSHOT_TTL_SECONDS * 1_000,
+            }
+            snapshot["bytes"] = len(_compact_json(ticks))
+            if snapshot["bytes"] > 750_000:
+                raise RuntimeError("tick_source_limit")
+            _admit_tick_snapshot(snapshot)
+            offset = 0
+        page_ticks = snapshot["ticks"][offset:offset + snapshot["pageSize"]]
+        next_offset = offset + len(page_ticks)
+        complete = next_offset == len(snapshot["ticks"])
+        response = {
+            "contractVersion": CURSOR_VERSION, "cursorNamespace": TICK_CURSOR_NAMESPACE,
+            "server": snapshot["server"], "accountLogin": snapshot["accountLogin"],
+            "symbol": snapshot["symbol"], "rawRange": snapshot["rawRange"],
+            "snapshotToMsc": snapshot["snapshotToMsc"],
+            "snapshot": {
+                "id": snapshot["id"], "sha256": snapshot["sha256"],
+                "tickCount": len(snapshot["ticks"]), "expiresAtMsc": snapshot["expiresAtMsc"],
+            },
+            "page": {"fromSequence": offset, "count": len(page_ticks), "complete": complete},
+            "ticks": page_ticks,
+        }
+        if not complete:
+            response["page"]["nextCursor"] = _encode_tick_cursor(snapshot, next_offset, config.bridge_token)
+        if len(_compact_json(response)) > TICK_RESPONSE_MAX_BYTES:
+            raise RuntimeError("tick response exceeds configured limit")
+        self._send_json(HTTPStatus.OK, response)
 
     def _handle_history_deals(self) -> None:
         _ensure_connected()

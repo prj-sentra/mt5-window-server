@@ -216,5 +216,67 @@ class BridgeV5Tests(unittest.TestCase):
         self.assertEqual(len(deal_tickets), len(set(deal_tickets)))
         self.assertEqual(len(order_tickets), len(set(order_tickets)))
 
+    def test_capabilities_advertise_independent_bounded_tick_contract(self):
+        handler = object.__new__(server.Mt5BridgeHandler)
+        sent = []
+        handler._send_json = lambda status, body: sent.append((status, body))
+        handler._handle_capabilities()
+        status, body = sent[0]
+        self.assertEqual(status, server.HTTPStatus.OK)
+        self.assertEqual(body["contractVersion"], 5)
+        self.assertEqual(body["ticks"]["cursorNamespace"], "ticks-v1")
+        self.assertEqual(body["ticks"]["maxChunkSpanMsc"], 300000)
+        self.assertLess(body["ticks"]["maxResponseBytes"], 1024 * 1024)
+
+    def test_tick_pages_are_immutable_request_bound_and_cursor_isolated(self):
+        Tick = namedtuple("Tick", "time_msc bid ask")
+        ticks = [Tick(1000 + index, 100 + index, 101 + index) for index in range(3)]
+        payload = {
+            "contractVersion": 5, "server": "Broker-Server", "accountLogin": 1,
+            "password": "password", "symbol": "XAUUSD",
+            "rawRange": {"fromMsc": 1000, "toMsc": 2000},
+            "snapshotToMsc": 3000, "pageSize": 2,
+        }
+        server.TICK_CACHE.clear()
+        server.TICK_CACHE_BYTES = 0
+        handler = object.__new__(server.Mt5BridgeHandler)
+        sent = []
+        handler._read_json_body = lambda: payload
+        handler._send_json = lambda status, body: sent.append((status, body))
+        with (
+            mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(bridge_token="test-token")),
+            mock.patch.object(server, "_login_for_sync"),
+            mock.patch.object(server.mt5, "COPY_TICKS_ALL", 3, create=True),
+            mock.patch.object(server.mt5, "copy_ticks_range", return_value=ticks, create=True) as copy_ticks,
+        ):
+            handler._handle_ticks()
+            first = sent[-1][1]
+            self.assertFalse(first["page"]["complete"])
+            self.assertEqual([tick["sequence"] for tick in first["ticks"]], [0, 1])
+            payload = {"contractVersion": 5, "pageCursor": first["page"]["nextCursor"]}
+            handler._handle_ticks()
+            second = sent[-1][1]
+        self.assertTrue(second["page"]["complete"])
+        self.assertEqual([tick["sequence"] for tick in second["ticks"]], [2])
+        copy_ticks.assert_called_once()
+        self.assertEqual(first["snapshot"]["id"], second["snapshot"]["id"])
+        with self.assertRaisesRegex(ValueError, "invalid_or_expired_tick_cursor"):
+            server._decode_tick_cursor(
+                server._encode_cursor(
+                    token="test-token", mode="bootstrap", server="Broker-Server",
+                    account_login=1, snapshot_to_msc=3000, deal_key=None, order_key=None,
+                    changed_since_msc=None, open_position_ids=(),
+                ),
+                "test-token",
+            )
+
+    def test_tick_snapshot_digest_is_stable_and_price_sensitive(self):
+        ticks = [{"sequence": 0, "timeMsc": 1000, "bid": "100", "ask": "101"}]
+        self.assertEqual(server._tick_snapshot_digest(ticks), server._tick_snapshot_digest(list(ticks)))
+        self.assertNotEqual(
+            server._tick_snapshot_digest(ticks),
+            server._tick_snapshot_digest([{**ticks[0], "ask": "102"}]),
+        )
+
 if __name__ == "__main__":
     unittest.main()
