@@ -165,7 +165,8 @@ try {
         $tickValid = $true
     }
 } catch {
-    $tickError = $_.Exception.Message
+    $details = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { [string]$_.ErrorDetails.Message } else { '' }
+    $tickError = if ([string]::IsNullOrWhiteSpace($details)) { $_.Exception.Message } else { "$($_.Exception.Message) :: $details" }
     $tickValid = $false
 }
 
