@@ -247,16 +247,22 @@ class BridgeV5Tests(unittest.TestCase):
             mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(bridge_token="test-token")),
             mock.patch.object(server, "_login_for_sync"),
             mock.patch.object(server.mt5, "COPY_TICKS_ALL", 3, create=True),
+            mock.patch.object(server.mt5, "SYMBOL_CALC_MODE_FOREX", 0, create=True),
             mock.patch.object(server.mt5, "copy_ticks_range", return_value=ticks, create=True) as copy_ticks,
+            mock.patch.object(server.mt5, "account_info", return_value=Account(1, 12, "USD", 2), create=True),
+            mock.patch.object(server.mt5, "symbol_info", return_value=types.SimpleNamespace(
+                trade_calc_mode=0, currency_profit="USD", trade_tick_size=0.01,
+                trade_tick_value_profit=1, trade_tick_value_loss=1,
+            ), create=True),
         ):
             handler._handle_ticks()
             first = sent[-1][1]
-            self.assertFalse(first["page"]["complete"])
+            self.assertFalse(first["complete"])
             self.assertEqual([tick["sequence"] for tick in first["ticks"]], [0, 1])
-            payload = {"contractVersion": 5, "pageCursor": first["page"]["nextCursor"]}
+            payload = {"contractVersion": 5, "pageCursor": first["nextCursor"]}
             handler._handle_ticks()
             second = sent[-1][1]
-        self.assertTrue(second["page"]["complete"])
+        self.assertTrue(second["complete"])
         self.assertEqual([tick["sequence"] for tick in second["ticks"]], [2])
         copy_ticks.assert_called_once()
         self.assertEqual(first["snapshot"]["id"], second["snapshot"]["id"])

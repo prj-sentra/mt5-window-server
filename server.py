@@ -134,6 +134,48 @@ def _tick_snapshot_digest(ticks: list[dict[str, Any]]) -> str:
     return digest.hexdigest()
 
 
+def _digest_parts(parts: list[str | int]) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        if isinstance(part, int):
+            digest.update(part.to_bytes(8, "big"))
+        else:
+            encoded = part.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise RuntimeError("tick_valuation_unsupported")
+    mode_by_value = {
+        getattr(mt5, "SYMBOL_CALC_MODE_FOREX", 0): "FOREX",
+        getattr(mt5, "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", 10): "FOREX_NO_LEVERAGE",
+    }
+    calculation_mode = mode_by_value.get(getattr(info, "trade_calc_mode", None))
+    if calculation_mode is None:
+        raise RuntimeError("tick_valuation_unsupported")
+    account_currency = str(getattr(account, "currency", "") or "")
+    profit_currency = str(getattr(info, "currency_profit", "") or "")
+    if not account_currency or not profit_currency:
+        raise RuntimeError("tick_valuation_unsupported")
+    tick_size = _canonical_positive_number(getattr(info, "trade_tick_size", None), "tickSize")
+    tick_value_profit = _canonical_positive_number(getattr(info, "trade_tick_value_profit", None), "tickValueProfit")
+    tick_value_loss = _canonical_positive_number(getattr(info, "trade_tick_value_loss", None), "tickValueLoss")
+    values = {
+        "version": 1, "calculationMode": calculation_mode,
+        "accountCurrency": account_currency, "profitCurrency": profit_currency,
+        "tickSize": tick_size, "tickValueProfit": tick_value_profit, "tickValueLoss": tick_value_loss,
+    }
+    values["sha256"] = _digest_parts([
+        "ticks-v1-valuation", 1, calculation_mode, account_currency, profit_currency,
+        tick_size, tick_value_profit, tick_value_loss,
+    ])
+    return values
+
+
 def _encode_tick_cursor(snapshot: dict[str, Any], next_sequence: int, token: str) -> str:
     payload = json.dumps({
         "kind": TICK_CURSOR_NAMESPACE, "v": CURSOR_VERSION,
@@ -592,6 +634,10 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 )
                 if source is None:
                     raise RuntimeError(f"mt5.copy_ticks_range() failed: {mt5.last_error()}")
+                account = mt5.account_info()
+                if account is None:
+                    raise RuntimeError(f"mt5.account_info() failed: {mt5.last_error()}")
+                valuation = _symbol_valuation(symbol, account)
                 rows = []
                 for source_index, tick in enumerate(source):
                     time_msc = int(tick.time_msc)
@@ -613,6 +659,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 "id": uuid.uuid4().hex, "server": server, "accountLogin": account_login,
                 "symbol": symbol, "rawRange": {"fromMsc": from_msc, "toMsc": to_msc},
                 "snapshotToMsc": snapshot_to_msc, "pageSize": page_size, "ticks": ticks,
+                "valuation": valuation,
                 "sha256": _tick_snapshot_digest(ticks),
                 "expiresAtMsc": int(time.time() * 1_000) + TICK_SNAPSHOT_TTL_SECONDS * 1_000,
             }
@@ -629,16 +676,24 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             "server": snapshot["server"], "accountLogin": snapshot["accountLogin"],
             "symbol": snapshot["symbol"], "rawRange": snapshot["rawRange"],
             "snapshotToMsc": snapshot["snapshotToMsc"],
+            "pageSize": snapshot["pageSize"],
             "snapshot": {
                 "id": snapshot["id"], "sha256": snapshot["sha256"],
                 "tickCount": len(snapshot["ticks"]), "expiresAtMsc": snapshot["expiresAtMsc"],
             },
-            "page": {"fromSequence": offset, "count": len(page_ticks), "complete": complete},
+            "valuation": snapshot["valuation"],
             "ticks": page_ticks,
+            "complete": complete,
+            "bytes": 0,
         }
         if not complete:
-            response["page"]["nextCursor"] = _encode_tick_cursor(snapshot, next_offset, config.bridge_token)
-        if len(_compact_json(response)) > TICK_RESPONSE_MAX_BYTES:
+            response["nextCursor"] = _encode_tick_cursor(snapshot, next_offset, config.bridge_token)
+        while True:
+            size = len(_compact_json(response))
+            if response["bytes"] == size:
+                break
+            response["bytes"] = size
+        if size > TICK_RESPONSE_MAX_BYTES:
             raise RuntimeError("tick response exceeds configured limit")
         self._send_json(HTTPStatus.OK, response)
 
