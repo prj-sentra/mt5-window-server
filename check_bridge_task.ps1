@@ -160,6 +160,8 @@ try {
             if ($tickPage.complete) { break }
             $tickPayload = @{ contractVersion = 5; pageCursor = $tickPage.nextCursor }
         } while ($true)
+        if ($tickCount -le 0) { throw 'Tick probe returned no ticks' }
+        if (-not $tickPage.snapshot.sha256 -or -not $tickPage.valuation.sha256) { throw 'Tick provenance digest is missing' }
         $tickValid = $true
     }
 } catch {
@@ -190,6 +192,10 @@ try {
     TickCapabilityOk = ($null -ne $capabilities)
     TickProbeOk = $tickValid
     TickProbeError = $tickError
+    TickCount = if ($tickValid -and -not [string]::IsNullOrWhiteSpace($TickSymbol)) { $tickCount } else { $null }
+    TickSnapshotSha256 = if ($tickValid -and $null -ne $tickPage) { $tickPage.snapshot.sha256 } else { $null }
+    TickValuationSha256 = if ($tickValid -and $null -ne $tickPage) { $tickPage.valuation.sha256 } else { $null }
+    TickCalculationMode = if ($tickValid -and $null -ne $tickPage) { $tickPage.valuation.calculationMode } else { $null }
 }
 
 Write-Host '--- matching processes ---'

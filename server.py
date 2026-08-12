@@ -165,6 +165,21 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
     tick_size = _canonical_positive_number(getattr(info, "trade_tick_size", None), "tickSize")
     tick_value_profit = _canonical_positive_number(getattr(info, "trade_tick_value_profit", None), "tickValueProfit")
     tick_value_loss = _canonical_positive_number(getattr(info, "trade_tick_value_loss", None), "tickValueLoss")
+    point = Decimal(tick_size)
+    reference = Decimal("1")
+    for order_type, direction in (
+        (getattr(mt5, "ORDER_TYPE_BUY", 0), Decimal(1)),
+        (getattr(mt5, "ORDER_TYPE_SELL", 1), Decimal(-1)),
+    ):
+        for signed_step in (Decimal(1), Decimal(-1)):
+            close = reference + direction * signed_step * point
+            observed = mt5.order_calc_profit(order_type, symbol, 1.0, float(reference), float(close))
+            if observed is None:
+                raise RuntimeError("tick_valuation_unsupported")
+            expected_tick_value = Decimal(tick_value_profit if signed_step > 0 else tick_value_loss)
+            expected = signed_step * expected_tick_value
+            if abs(Decimal(str(observed)) - expected) > Decimal("0.00000001"):
+                raise RuntimeError("tick_valuation_unsupported")
     values = {
         "version": 1, "calculationMode": calculation_mode,
         "accountCurrency": account_currency, "profitCurrency": profit_currency,

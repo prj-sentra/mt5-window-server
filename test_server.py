@@ -254,6 +254,12 @@ class BridgeV5Tests(unittest.TestCase):
                 trade_calc_mode=0, currency_profit="USD", trade_tick_size=0.01,
                 trade_tick_value_profit=1, trade_tick_value_loss=1,
             ), create=True),
+            mock.patch.object(
+                server.mt5, "order_calc_profit",
+                side_effect=lambda order_type, _symbol, _lots, opened, closed:
+                    (closed - opened) / 0.01 * (1 if order_type == 0 else -1),
+                create=True,
+            ),
         ):
             handler._handle_ticks()
             first = sent[-1][1]
