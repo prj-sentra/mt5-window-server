@@ -153,6 +153,17 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
         raise RuntimeError("tick_valuation_unsupported")
     mode_by_value = {
         getattr(mt5, "SYMBOL_CALC_MODE_FOREX", 0): "FOREX",
+        getattr(mt5, "SYMBOL_CALC_MODE_FUTURES", 2): "FUTURES",
+        getattr(mt5, "SYMBOL_CALC_MODE_CFD", 1): "CFD",
+        getattr(mt5, "SYMBOL_CALC_MODE_CFDINDEX", 3): "CFDINDEX",
+        getattr(mt5, "SYMBOL_CALC_MODE_CFDLEVERAGE", 4): "CFDLEVERAGE",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_STOCKS", 32): "EXCH_STOCKS",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_FUTURES", 33): "EXCH_FUTURES",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS", 34): "EXCH_FUTURES_FORTS",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_BONDS", 35): "EXCH_BONDS",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX", 36): "EXCH_STOCKS_MOEX",
+        getattr(mt5, "SYMBOL_CALC_MODE_EXCH_BONDS_MOEX", 37): "EXCH_BONDS_MOEX",
+        getattr(mt5, "SYMBOL_CALC_MODE_SERV_COLLATERAL", 64): "SERV_COLLATERAL",
         getattr(mt5, "SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE", 10): "FOREX_NO_LEVERAGE",
     }
     calculation_mode = mode_by_value.get(getattr(info, "trade_calc_mode", None))
@@ -166,7 +177,11 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
     tick_value_profit = _canonical_positive_number(getattr(info, "trade_tick_value_profit", None), "tickValueProfit")
     tick_value_loss = _canonical_positive_number(getattr(info, "trade_tick_value_loss", None), "tickValueLoss")
     point = Decimal(tick_size)
-    reference = Decimal("1")
+    current_tick = mt5.symbol_info_tick(symbol)
+    reference_value = getattr(current_tick, "last", 0) or getattr(current_tick, "bid", 0) or getattr(current_tick, "ask", 0)
+    reference = Decimal(str(reference_value))
+    if reference <= 0:
+        raise RuntimeError("tick_valuation_unsupported")
     for order_type, direction in (
         (getattr(mt5, "ORDER_TYPE_BUY", 0), Decimal(1)),
         (getattr(mt5, "ORDER_TYPE_SELL", 1), Decimal(-1)),
@@ -178,7 +193,8 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
                 raise RuntimeError("tick_valuation_unsupported")
             expected_tick_value = Decimal(tick_value_profit if signed_step > 0 else tick_value_loss)
             expected = signed_step * expected_tick_value
-            if abs(Decimal(str(observed)) - expected) > Decimal("0.00000001"):
+            tolerance = max(Decimal("0.00000001"), abs(expected) * Decimal("0.000001"))
+            if abs(Decimal(str(observed)) - expected) > tolerance:
                 raise RuntimeError("tick_valuation_unsupported")
     values = {
         "version": 1, "calculationMode": calculation_mode,

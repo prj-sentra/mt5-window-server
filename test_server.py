@@ -55,6 +55,7 @@ class BridgeV5Tests(unittest.TestCase):
             mock.patch.object(server.mt5, "history_deals_get", side_effect=history_deals_get, create=True),
             mock.patch.object(server.mt5, "history_orders_get", side_effect=history_orders_get, create=True),
             mock.patch.object(server.mt5, "account_info", return_value=Account(1, 12, "USD", 2), create=True),
+            mock.patch.object(server.mt5, "symbol_info_tick", return_value=types.SimpleNamespace(last=1, bid=1, ask=1), create=True),
         ):
             while True:
                 handler = object.__new__(server.Mt5BridgeHandler)
@@ -250,6 +251,7 @@ class BridgeV5Tests(unittest.TestCase):
             mock.patch.object(server.mt5, "SYMBOL_CALC_MODE_FOREX", 0, create=True),
             mock.patch.object(server.mt5, "copy_ticks_range", return_value=ticks, create=True) as copy_ticks,
             mock.patch.object(server.mt5, "account_info", return_value=Account(1, 12, "USD", 2), create=True),
+            mock.patch.object(server.mt5, "symbol_info_tick", return_value=types.SimpleNamespace(last=1, bid=1, ask=1), create=True),
             mock.patch.object(server.mt5, "symbol_info", return_value=types.SimpleNamespace(
                 trade_calc_mode=0, currency_profit="USD", trade_tick_size=0.01,
                 trade_tick_value_profit=1, trade_tick_value_loss=1,
