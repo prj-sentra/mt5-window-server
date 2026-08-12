@@ -79,6 +79,7 @@ TICK_CACHE_MAX_BYTES = 6_000_000
 TICK_CURSOR_NAMESPACE = "ticks-v1"
 TICK_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TICK_CACHE_BYTES = 0
+TICK_CACHE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,18 +201,19 @@ def _decode_tick_cursor(raw: Any, token: str) -> tuple[dict[str, Any], int]:
         decoded = json.loads(payload)
         if decoded.get("kind") != TICK_CURSOR_NAMESPACE or decoded.get("v") != CURSOR_VERSION:
             raise ValueError
-        snapshot = TICK_CACHE.get(decoded["snapshotId"])
-        if (
-            snapshot is None or snapshot["expiresAtMsc"] <= int(time.time() * 1_000)
-            or decoded["snapshotSha256"] != snapshot["sha256"]
-            or any(decoded[key] != snapshot[key] for key in (
-                "server", "accountLogin", "symbol", "rawRange", "snapshotToMsc", "pageSize", "expiresAtMsc"
-            ))
-            or not isinstance(decoded["nextSequence"], int)
-            or decoded["nextSequence"] < 0
-        ):
-            raise ValueError
-        TICK_CACHE.move_to_end(snapshot["id"])
+        with TICK_CACHE_LOCK:
+            snapshot = TICK_CACHE.get(decoded["snapshotId"])
+            if (
+                snapshot is None or snapshot["expiresAtMsc"] <= int(time.time() * 1_000)
+                or decoded["snapshotSha256"] != snapshot["sha256"]
+                or any(decoded[key] != snapshot[key] for key in (
+                    "server", "accountLogin", "symbol", "rawRange", "snapshotToMsc", "pageSize", "expiresAtMsc"
+                ))
+                or not isinstance(decoded["nextSequence"], int)
+                or decoded["nextSequence"] < 0
+            ):
+                raise ValueError
+            TICK_CACHE.move_to_end(snapshot["id"])
         return snapshot, decoded["nextSequence"]
     except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid_or_expired_tick_cursor") from exc
@@ -226,17 +228,18 @@ def _expire_tick_cache() -> None:
 
 def _admit_tick_snapshot(snapshot: dict[str, Any]) -> None:
     global TICK_CACHE_BYTES
-    _expire_tick_cache()
-    while TICK_CACHE and (
-        len(TICK_CACHE) >= TICK_CACHE_MAX_ENTRIES
-        or TICK_CACHE_BYTES + snapshot["bytes"] > TICK_CACHE_MAX_BYTES
-    ):
-        _, evicted = TICK_CACHE.popitem(last=False)
-        TICK_CACHE_BYTES -= evicted["bytes"]
-    if snapshot["bytes"] > TICK_CACHE_MAX_BYTES:
-        raise RuntimeError("tick_snapshot_capacity")
-    TICK_CACHE[snapshot["id"]] = snapshot
-    TICK_CACHE_BYTES += snapshot["bytes"]
+    with TICK_CACHE_LOCK:
+        _expire_tick_cache()
+        while TICK_CACHE and (
+            len(TICK_CACHE) >= TICK_CACHE_MAX_ENTRIES
+            or TICK_CACHE_BYTES + snapshot["bytes"] > TICK_CACHE_MAX_BYTES
+        ):
+            _, evicted = TICK_CACHE.popitem(last=False)
+            TICK_CACHE_BYTES -= evicted["bytes"]
+        if snapshot["bytes"] > TICK_CACHE_MAX_BYTES:
+            raise RuntimeError("tick_snapshot_capacity")
+        TICK_CACHE[snapshot["id"]] = snapshot
+        TICK_CACHE_BYTES += snapshot["bytes"]
 
 def _currency_digits(account: Any) -> int:
     value = getattr(account, "currency_digits", None)

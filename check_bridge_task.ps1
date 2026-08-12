@@ -1,5 +1,6 @@
 param(
-    [string]$TaskName = 'MT5 Bridge Server'
+    [string]$TaskName = 'MT5 Bridge Server',
+    [string]$TickSymbol = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +65,7 @@ $localHost = if ($config['BRIDGE_HOST'] -eq '0.0.0.0') { '127.0.0.1' } else { $c
 $port = [int]$config['BRIDGE_PORT']
 $token = $config['BRIDGE_TOKEN']
 $healthUrl = "http://${localHost}:${port}/health"
+$baseUrl = "http://${localHost}:${port}"
 $headers = @{ Authorization = "Bearer $token" }
 
 $task = Get-ScheduledTask -TaskName $TaskName
@@ -89,6 +91,9 @@ for ($attempt = 1; $attempt -le 10; $attempt++) {
 
 $sync = $null
 $syncValid = $false
+$capabilities = $null
+$tickValid = [string]::IsNullOrWhiteSpace($TickSymbol)
+$tickError = ''
 $syncError = $null
 $syncDealCount = 0
 $syncOrderCount = 0
@@ -130,6 +135,38 @@ if ($null -ne $health) {
     }
 }
 
+try {
+    $capabilities = Invoke-RestMethod -Uri "$baseUrl/capabilities" -Headers $headers -Method Get
+    if ($capabilities.contractVersion -ne 5 -or $capabilities.ticks.cursorNamespace -ne 'ticks-v1') {
+        throw 'Bridge capabilities do not advertise the required ticks-v1 contract'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TickSymbol)) {
+        $snapshotToMsc = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $tickPayload = @{
+            contractVersion = 5
+            server = $config['MT5_SERVER']
+            accountLogin = [int64]$config['MT5_LOGIN']
+            password = $config['MT5_PASSWORD']
+            symbol = $TickSymbol
+            rawRange = @{ fromMsc = $snapshotToMsc - 300000; toMsc = $snapshotToMsc }
+            snapshotToMsc = $snapshotToMsc
+            pageSize = 1000
+        }
+        $tickCount = 0
+        do {
+            $tickPage = Invoke-RestMethod -Uri "$baseUrl/ticks" -Headers $headers -Method Post -ContentType 'application/json' -Body ($tickPayload | ConvertTo-Json -Depth 5)
+            if ($tickPage.cursorNamespace -ne 'ticks-v1' -or $tickPage.symbol -ne $TickSymbol) { throw 'Invalid tick page identity' }
+            $tickCount += @($tickPage.ticks).Count
+            if ($tickPage.complete) { break }
+            $tickPayload = @{ contractVersion = 5; pageCursor = $tickPage.nextCursor }
+        } while ($true)
+        $tickValid = $true
+    }
+} catch {
+    $tickError = $_.Exception.Message
+    $tickValid = $false
+}
+
 [pscustomobject]@{
     TaskName = $task.TaskName
     TaskState = $task.State
@@ -150,6 +187,9 @@ if ($null -ne $health) {
     SyncPageCount = if ($syncValid) { $syncPageCount } else { $null }
     SyncCurrency = if ($null -ne $sync) { $sync.account.currency } else { $null }
     SyncCurrentBalance = if ($null -ne $sync) { $sync.account.currentBalance } else { $null }
+    TickCapabilityOk = ($null -ne $capabilities)
+    TickProbeOk = $tickValid
+    TickProbeError = $tickError
 }
 
 Write-Host '--- matching processes ---'
@@ -192,6 +232,7 @@ if ($syncValid) {
 if ($null -eq $health -or -not $syncValid) {
     exit 1
 }
+if (-not $tickValid) { exit 1 }
 
 
 
