@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
 import functools
 import json
@@ -63,7 +62,9 @@ logging.basicConfig(
 LOGGER = logging.getLogger("mt5-bridge-server")
 
 MT5_LOCK = threading.RLock()
-CURSOR_VERSION = 4
+CURSOR_VERSION = 5
+SYNC_RESPONSE_TARGET_BYTES = 768 * 1024
+SYNC_RESPONSE_MAX_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,55 +164,118 @@ def _order_key(order: Any) -> tuple[int, int]:
     return max(int(order.time_done_msc), int(order.time_setup_msc)), int(order.ticket)
 
 
-def _facts_digest(facts: list[dict[str, Any]]) -> str:
-    encoded = json.dumps(
-        facts,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _encode_cursor(deals_digest: str, orders_digest: str, token: str) -> str:
+def _encode_cursor(
+    *,
+    token: str,
+    mode: str,
+    server: str,
+    account_login: int,
+    snapshot_to_msc: int,
+    deal_key: tuple[int, int] | None,
+    order_key: tuple[int, int] | None,
+    changed_since_msc: int | None,
+    open_position_ids: tuple[str, ...],
+) -> str:
     payload = json.dumps(
-        {"v": CURSOR_VERSION, "d": deals_digest, "o": orders_digest},
+        {
+            "v": CURSOR_VERSION,
+            "m": mode,
+            "s": server,
+            "a": account_login,
+            "t": snapshot_to_msc,
+            "d": deal_key,
+            "o": order_key,
+            "c": changed_since_msc,
+            "p": open_position_ids,
+        },
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    signature = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).digest()
+    signature = hmac.new(token.encode("utf-8"), payload, "sha256").digest()
     return base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
 
 
-def _decode_cursor(raw: Any, token: str) -> tuple[str, str]:
+def _decode_cursor(
+    raw: Any,
+    *,
+    token: str,
+    mode: str,
+    server: str,
+    account_login: int,
+    snapshot_to_msc: int,
+    changed_since_msc: int | None,
+    open_position_ids: tuple[str, ...],
+) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
     if raw in {None, ""}:
-        return "", ""
+        return None, None
     if not isinstance(raw, str):
-        raise ValueError("'cursor' must be an opaque string")
+        raise ValueError("'pageCursor' must be an opaque string")
     try:
         padded = raw + "=" * (-len(raw) % 4)
         signed = base64.urlsafe_b64decode(padded.encode("ascii"))
         payload, supplied = signed[:-32], signed[-32:]
-        expected = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).digest()
+        expected = hmac.new(token.encode("utf-8"), payload, "sha256").digest()
         if not hmac.compare_digest(supplied, expected):
             raise ValueError
         decoded = json.loads(payload.decode("utf-8"))
-        version = decoded.get("v")
         if (
-            version not in {2, 3, CURSOR_VERSION}
-            or not isinstance(decoded.get("d"), str)
-            or not isinstance(decoded.get("o"), str)
-            or any(
-                digest and (len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest))
-                for digest in (decoded["d"], decoded["o"])
-            )
+            decoded.get("v") != CURSOR_VERSION
+            or decoded.get("m") != mode
+            or decoded.get("s") != server
+            or decoded.get("a") != account_login
+            or decoded.get("t") != snapshot_to_msc
+            or decoded.get("c") != changed_since_msc
+            or decoded.get("p") != list(open_position_ids)
         ):
             raise ValueError
-        if version != CURSOR_VERSION:
-            return "", ""
-        return decoded["d"], decoded["o"]
+        keys: list[tuple[int, int] | None] = []
+        for key in (decoded.get("d"), decoded.get("o")):
+            if key is None:
+                keys.append(None)
+                continue
+            if (
+                not isinstance(key, list)
+                or len(key) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in key)
+            ):
+                raise ValueError
+            keys.append((key[0], key[1]))
+        return keys[0], keys[1]
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ValueError("invalid or expired cursor") from exc
+
+
+def _positive_id_strings(raw: Any) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("'openPositionIds' must be an array of positive decimal strings")
+    values: list[str] = []
+    for value in raw:
+        if (
+            not isinstance(value, str)
+            or not value
+            or not value.isdecimal()
+            or value.startswith("0")
+        ):
+            raise ValueError("'openPositionIds' must contain unique positive decimal strings")
+        values.append(value)
+    if len(values) != len(set(values)):
+        raise ValueError("'openPositionIds' must contain unique positive decimal strings")
+    return tuple(sorted(values, key=int))
+
+
+def _dedupe_sorted(facts: list[Any], key: Any) -> list[Any]:
+    result: list[Any] = []
+    tickets: set[int] = set()
+    for fact in sorted(facts, key=key):
+        ticket = int(fact.ticket)
+        if ticket not in tickets:
+            tickets.add(ticket)
+            result.append(fact)
+    return result
+
+
+def _compact_json(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _serialize_deal(deal: Any) -> dict[str, Any]:
@@ -282,7 +346,7 @@ def _ensure_connected() -> None:
 
 
 class Mt5BridgeHandler(BaseHTTPRequestHandler):
-    server_version = "Mt5Bridge/4.0"
+    server_version = "Mt5Bridge/5.0"
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -421,6 +485,8 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
     def _handle_sync(self) -> None:
         config = _get_config()
         payload = self._read_json_body()
+        if payload.get("contractVersion") != CURSOR_VERSION:
+            raise ValueError("'contractVersion' must be 5")
         server = payload.get("server")
         account_login = payload.get("accountLogin")
         password = payload.get("password")
@@ -430,55 +496,121 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             raise ValueError("'accountLogin' must be a positive integer")
         if not isinstance(password, str) or not password:
             raise ValueError("'password' must be a non-empty string")
-
-        previous_deals_digest, previous_orders_digest = _decode_cursor(
-            payload.get("cursor"),
-            config.bridge_token,
+        mode = payload.get("mode")
+        if mode not in {"bootstrap", "incremental"}:
+            raise ValueError("'mode' must be 'bootstrap' or 'incremental'")
+        snapshot_to_msc = payload.get("snapshotToMsc")
+        snapshot_to = _history_datetime(snapshot_to_msc, "snapshotToMsc")
+        changed_since_msc: int | None = None
+        open_position_ids: tuple[str, ...] = ()
+        if mode == "bootstrap":
+            if "changedSinceMsc" in payload or "openPositionIds" in payload:
+                raise ValueError("bootstrap requests must not include incremental-only fields")
+        else:
+            changed_since_msc = payload.get("changedSinceMsc")
+            _history_datetime(changed_since_msc, "changedSinceMsc", allow_zero=True)
+            if changed_since_msc > snapshot_to_msc:
+                raise ValueError("'changedSinceMsc' must not exceed 'snapshotToMsc'")
+            open_position_ids = _positive_id_strings(payload.get("openPositionIds"))
+        previous_deal_key, previous_order_key = _decode_cursor(
+            payload.get("pageCursor"),
+            token=config.bridge_token,
+            mode=mode,
+            server=server,
+            account_login=account_login,
+            snapshot_to_msc=snapshot_to_msc,
+            changed_since_msc=changed_since_msc,
+            open_position_ids=open_position_ids,
         )
         with MT5_LOCK:
             _login_for_sync(server, account_login, password)
-            history_from = _history_datetime(payload.get("historyFromMsc"), "historyFromMsc", allow_zero=True)
-            history_to = _history_datetime(payload.get("historyToMsc"), "historyToMsc")
-            if history_to < history_from:
-                raise ValueError("'historyToMsc' must not precede 'historyFromMsc'")
-            all_deals = mt5.history_deals_get(history_from, history_to)
-            all_orders = mt5.history_orders_get(history_from, history_to)
-            account = mt5.account_info()
-            if all_deals is None:
+            history_from = (
+                datetime(1970, 1, 1, tzinfo=UTC)
+                if mode == "bootstrap"
+                else _history_datetime(changed_since_msc, "changedSinceMsc", allow_zero=True)
+            )
+            all_deals_result = mt5.history_deals_get(history_from, snapshot_to)
+            all_orders_result = mt5.history_orders_get(history_from, snapshot_to)
+            if all_deals_result is None:
                 raise RuntimeError(f"mt5.history_deals_get() failed: {mt5.last_error()}")
-            if all_orders is None:
+            if all_orders_result is None:
                 raise RuntimeError(f"mt5.history_orders_get() failed: {mt5.last_error()}")
+            all_deals = list(all_deals_result)
+            all_orders = list(all_orders_result)
+            for position_id in open_position_ids:
+                position_deals = mt5.history_deals_get(position=int(position_id))
+                position_orders = mt5.history_orders_get(position=int(position_id))
+                if position_deals is None:
+                    raise RuntimeError(f"mt5.history_deals_get(position) failed: {mt5.last_error()}")
+                if position_orders is None:
+                    raise RuntimeError(f"mt5.history_orders_get(position) failed: {mt5.last_error()}")
+                all_deals.extend(deal for deal in position_deals if int(deal.time_msc) <= snapshot_to_msc)
+                all_orders.extend(order for order in position_orders if _order_key(order)[0] <= snapshot_to_msc)
+            account = mt5.account_info()
             if account is None:
                 raise RuntimeError(f"mt5.account_info() failed: {mt5.last_error()}")
 
-            deals = sorted(all_deals, key=_deal_key)
-            orders = sorted(all_orders, key=_order_key)
-            serialized_deals = [_serialize_deal(deal) for deal in deals]
-            serialized_orders = [_serialize_order(order) for order in orders]
-            deals_digest = _facts_digest(serialized_deals)
-            orders_digest = _facts_digest(serialized_orders)
-            changed_deals = [] if deals_digest == previous_deals_digest else serialized_deals
-            changed_orders = [] if orders_digest == previous_orders_digest else serialized_orders
+            deals = _dedupe_sorted(all_deals, _deal_key)
+            orders = _dedupe_sorted(all_orders, _order_key)
 
-        response = {
-            "contractVersion": 4,
+        response_base = {
+            "contractVersion": CURSOR_VERSION,
             "server": server,
             "accountLogin": account_login,
-            "cursor": _encode_cursor(deals_digest, orders_digest, config.bridge_token),
-            "historyRange": {
-                "fromMsc": payload["historyFromMsc"],
-                "toMsc": payload["historyToMsc"],
-            },
+            "mode": mode,
+            "snapshotToMsc": snapshot_to_msc,
             "account": {
                 "currency": str(account.currency or ""),
                 "currentBalance": _canonical_number(account.balance),
                 "currencyDigits": _currency_digits(account),
             },
-            "deals": changed_deals,
-            "orders": changed_orders,
         }
-        if len(json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 1024 * 1024:
-            raise RuntimeError("bridge v4 response exceeds 1 MiB")
+        selected_deals: list[dict[str, Any]] = []
+        selected_orders: list[dict[str, Any]] = []
+        remaining: list[tuple[str, Any, tuple[int, int]]] = []
+        remaining.extend(("deal", deal, _deal_key(deal)) for deal in deals if previous_deal_key is None or _deal_key(deal) > previous_deal_key)
+        remaining.extend(("order", order, _order_key(order)) for order in orders if previous_order_key is None or _order_key(order) > previous_order_key)
+        remaining.sort(key=lambda item: (item[2], item[0]))
+        last_deal_key, last_order_key = previous_deal_key, previous_order_key
+
+        def response_for_page(has_more: bool) -> dict[str, Any]:
+            page: dict[str, Any] = {"hasMore": has_more, "bytes": 0}
+            if has_more:
+                page["nextCursor"] = _encode_cursor(
+                    token=config.bridge_token, mode=mode, server=server, account_login=account_login,
+                    snapshot_to_msc=snapshot_to_msc, deal_key=last_deal_key, order_key=last_order_key,
+                    changed_since_msc=changed_since_msc, open_position_ids=open_position_ids,
+                )
+            response = {**response_base, "page": page, "deals": selected_deals, "orders": selected_orders}
+            while True:
+                size = len(_compact_json(response))
+                if response["page"]["bytes"] == size:
+                    return response
+                response["page"]["bytes"] = size
+
+        consumed = 0
+        for stream, fact, key in remaining:
+            target = selected_deals if stream == "deal" else selected_orders
+            target.append(_serialize_deal(fact) if stream == "deal" else _serialize_order(fact))
+            old_deal_key, old_order_key = last_deal_key, last_order_key
+            if stream == "deal":
+                last_deal_key = key
+            else:
+                last_order_key = key
+            if len(_compact_json(response_for_page(consumed + 1 < len(remaining)))) > SYNC_RESPONSE_TARGET_BYTES:
+                target.pop()
+                last_deal_key, last_order_key = old_deal_key, old_order_key
+                if consumed == 0:
+                    target.append(_serialize_deal(fact) if stream == "deal" else _serialize_order(fact))
+                    last_deal_key = key if stream == "deal" else last_deal_key
+                    last_order_key = key if stream == "order" else last_order_key
+                    consumed = 1
+                break
+            consumed += 1
+        has_more = consumed < len(remaining)
+        response = response_for_page(has_more)
+        if len(_compact_json(response)) >= SYNC_RESPONSE_MAX_BYTES:
+            raise RuntimeError("bridge v5 response exceeds 1 MiB")
         self._send_json(HTTPStatus.OK, response)
     def _handle_profit_calc(self) -> None:
         _ensure_connected()
@@ -513,7 +645,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         )
 
     def _send_json(self, status: HTTPStatus, payload: Any) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = _compact_json(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

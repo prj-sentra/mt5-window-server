@@ -90,26 +90,26 @@ for ($attempt = 1; $attempt -le 10; $attempt++) {
 $sync = $null
 $syncValid = $false
 $syncError = $null
+$syncDealCount = 0
+$syncOrderCount = 0
+$syncPageCount = 0
 if ($null -ne $health) {
     try {
-        $syncBody = @{
+        $snapshotToMsc = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $syncRequest = @{
+            contractVersion = 5
             server = $config['MT5_SERVER']
             accountLogin = [int64]$config['MT5_LOGIN']
             password = $config['MT5_PASSWORD']
-            historyFromMsc = 0
-            historyToMsc = [DateTimeOffset]::UtcNow.AddHours(24).ToUnixTimeMilliseconds()
-        } | ConvertTo-Json
-        $sync = Invoke-RestMethod `
-            -Uri "http://${localHost}:${port}/sync" `
-            -Headers $headers `
-            -Method Post `
-            -ContentType 'application/json' `
-            -Body $syncBody `
-            -TimeoutSec 30
-        Assert-BridgeV4Response `
-            -Sync $sync `
-            -ExpectedServer $config['MT5_SERVER'] `
-            -ExpectedLogin ([int64]$config['MT5_LOGIN'])
+            mode = 'bootstrap'
+            snapshotToMsc = $snapshotToMsc
+        }
+        do {
+            $sync = Invoke-RestMethod -Uri "http://${localHost}:${port}/sync" -Headers $headers -Method Post -ContentType 'application/json' -Body ($syncRequest | ConvertTo-Json -Compress) -TimeoutSec 30
+            Assert-BridgeV5Response -Sync $sync -ExpectedServer $config['MT5_SERVER'] -ExpectedLogin ([int64]$config['MT5_LOGIN']) -ExpectedSnapshotToMsc $snapshotToMsc
+            $syncDealCount += @($sync.deals).Count; $syncOrderCount += @($sync.orders).Count; $syncPageCount++
+            if ($sync.page.hasMore) { $syncRequest.pageCursor = $sync.page.nextCursor }
+        } while ($sync.page.hasMore)
         $syncValid = $true
     } catch {
         $errorDetailsMessage = if (
@@ -145,8 +145,9 @@ if ($null -ne $health) {
     HealthUrl = $healthUrl
     SyncOk = $syncValid
     SyncError = $syncError
-    SyncDealCount = if ($null -ne $sync) { @($sync.deals).Count } else { $null }
-    SyncOrderCount = if ($null -ne $sync) { @($sync.orders).Count } else { $null }
+    SyncDealCount = if ($syncValid) { $syncDealCount } else { $null }
+    SyncOrderCount = if ($syncValid) { $syncOrderCount } else { $null }
+    SyncPageCount = if ($syncValid) { $syncPageCount } else { $null }
     SyncCurrency = if ($null -ne $sync) { $sync.account.currency } else { $null }
     SyncCurrentBalance = if ($null -ne $sync) { $sync.account.currentBalance } else { $null }
 }
@@ -172,16 +173,17 @@ if ($null -ne $health) {
     Write-Host $healthError
 }
 
-Write-Host '--- sync v4 summary ---'
+Write-Host '--- sync v5 bootstrap summary ---'
 if ($syncValid) {
     [pscustomobject]@{
         Server = $sync.server
         AccountLogin = $sync.accountLogin
-        DealCount = @($sync.deals).Count
-        OrderCount = @($sync.orders).Count
+        SnapshotToMsc = $sync.snapshotToMsc
+        PageCount = $syncPageCount
+        DealCount = $syncDealCount
+        OrderCount = $syncOrderCount
         Currency = $sync.account.currency
         CurrentBalance = $sync.account.currentBalance
-        CursorPresent = -not [string]::IsNullOrWhiteSpace($sync.cursor)
     }
 } else {
     Write-Host $syncError
