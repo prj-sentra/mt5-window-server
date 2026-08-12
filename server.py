@@ -547,6 +547,11 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             LOGGER.warning("POST %s rejected: %s", self.path, exc)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except RuntimeError as exc:
+            error = str(exc)
+            status = HTTPStatus.UNPROCESSABLE_ENTITY if error in {"tick_source_limit", "tick_valuation_unsupported"} else HTTPStatus.SERVICE_UNAVAILABLE if error == "tick_snapshot_capacity" else HTTPStatus.INTERNAL_SERVER_ERROR
+            LOGGER.warning("POST %s failed: %s", self.path, error)
+            self._send_json(status, {"error": error})
         except Exception as exc:  # pragma: no cover - exercised by manual runtime
             LOGGER.exception("POST %s failed", self.path)
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
