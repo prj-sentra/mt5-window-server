@@ -130,6 +130,39 @@ class BridgeV5Tests(unittest.TestCase):
             server.main()
         http.serve_forever.assert_called_once()
 
+    def test_rejected_account_password_restores_previous_terminal_session(self):
+        previous = types.SimpleNamespace(login=391597374, server="XMGlobal-MT5 14")
+        restored = types.SimpleNamespace(login=391597374, server="XMGlobal-MT5 14")
+        with (
+            mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(mt5_terminal="terminal.exe")),
+            mock.patch.object(server.mt5, "account_info", side_effect=[previous, None, restored], create=True),
+            mock.patch.object(server.mt5, "initialize", return_value=True, create=True) as initialize,
+            mock.patch.object(server.mt5, "login", side_effect=[False, True], create=True) as login,
+            mock.patch.object(server.mt5, "last_error", return_value=(-6, "Authorization failed"), create=True),
+            mock.patch.object(server.mt5, "shutdown", create=True) as shutdown,
+        ):
+            with self.assertRaisesRegex(server.SyncAccountAuthorizationError, "sync_account_authorization_failed"):
+                server._login_for_sync("XMGlobal-MT5 16", 410304608, "wrong-password")
+        shutdown.assert_called_once()
+        self.assertEqual(initialize.call_count, 2)
+        self.assertEqual(login.call_args_list, [
+            mock.call(login=410304608, password="wrong-password", server="XMGlobal-MT5 16"),
+            mock.call(login=391597374, server="XMGlobal-MT5 14"),
+        ])
+
+    def test_sync_authorization_error_is_a_bounded_422_response(self):
+        handler = object.__new__(server.Mt5BridgeHandler)
+        sent = []
+        handler.path = "/sync"
+        handler._require_auth = lambda: True
+        handler._handle_sync = mock.Mock(side_effect=server.SyncAccountAuthorizationError("private"))
+        handler._send_json = lambda status, body: sent.append((status, body))
+        handler.do_POST()
+        self.assertEqual(sent, [(
+            server.HTTPStatus.UNPROCESSABLE_ENTITY,
+            {"error": "sync_account_authorization_failed"},
+        )])
+
     def test_incremental_open_ids_are_canonical_and_validated(self):
         self.assertEqual(server._positive_id_strings(["10", "2"]), ("2", "10"))
         for value in (None, ["0"], ["01"], ["1", "1"], [1]):

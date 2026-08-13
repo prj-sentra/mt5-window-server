@@ -87,6 +87,10 @@ TICK_CACHE_BYTES = 0
 TICK_CACHE_LOCK = threading.RLock()
 SYNC_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 SYNC_CACHE_LOCK = threading.RLock()
+
+
+class SyncAccountAuthorizationError(RuntimeError):
+    pass
 SUPPORTED_CALCULATION_MODES = (
     ("SYMBOL_CALC_MODE_FOREX", 0, "FOREX"),
     ("SYMBOL_CALC_MODE_FUTURES", 2, "FUTURES"),
@@ -529,10 +533,32 @@ def _serialize_order(order: Any) -> dict[str, Any]:
 
 def _login_for_sync(server: str, account_login: int, password: str) -> None:
     config = _get_config()
+    previous = mt5.account_info()
     if not mt5.initialize(path=config.mt5_terminal):
         raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
     if not mt5.login(login=account_login, password=password, server=server):
-        raise RuntimeError(f"mt5.login() failed: {mt5.last_error()}")
+        login_error = mt5.last_error()
+        # A rejected investor password can leave the shared terminal session
+        # unauthorized. Recover the previously authenticated account using the
+        # terminal's saved credentials so one bad account cannot take down all
+        # subsequent syncs.
+        mt5.shutdown()
+        restored = mt5.initialize(path=config.mt5_terminal)
+        current = mt5.account_info() if restored else None
+        if previous is not None and (current is None or int(current.login) != int(previous.login)):
+            restored = bool(mt5.login(
+                login=int(previous.login),
+                server=str(previous.server or ""),
+            ))
+            current = mt5.account_info() if restored else None
+        if previous is not None and (current is None or int(current.login) != int(previous.login)):
+            LOGGER.error(
+                "failed to restore MT5 account %s after rejected login for %s: %s",
+                previous.login, account_login, mt5.last_error(),
+            )
+        raise SyncAccountAuthorizationError(
+            f"sync_account_authorization_failed: {login_error[0]}"
+        )
     account = mt5.account_info()
     if account is None or int(account.login) != account_login:
         raise RuntimeError("MT5 logged into an unexpected account")
@@ -589,6 +615,12 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             LOGGER.warning("POST %s rejected: %s", self.path, exc)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except SyncAccountAuthorizationError as exc:
+            LOGGER.warning("POST %s rejected account credentials: %s", self.path, exc)
+            self._send_json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {"error": "sync_account_authorization_failed"},
+            )
         except RuntimeError as exc:
             error = str(exc)
             status = HTTPStatus.UNPROCESSABLE_ENTITY if error in {"tick_source_limit", "tick_valuation_unsupported"} else HTTPStatus.SERVICE_UNAVAILABLE if error == "tick_snapshot_capacity" else HTTPStatus.INTERNAL_SERVER_ERROR
