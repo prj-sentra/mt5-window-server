@@ -6,7 +6,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $serverScript = Join-Path $scriptDir 'server.py'
 $envFile = Join-Path $scriptDir '.env'
 $logDir = Join-Path $scriptDir 'logs'
-$logFile = Join-Path $logDir 'bridge.log'
+$logFile = Join-Path $logDir 'launcher.log'
 $venvPython = Join-Path $scriptDir '.venv\Scripts\python.exe'
 
 function Write-BridgeLog {
@@ -29,6 +29,10 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+if ((Test-Path -LiteralPath $logFile) -and (Get-Item -LiteralPath $logFile).Length -gt 10MB) {
+    $archive = Join-Path $logDir "launcher-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    Move-Item -LiteralPath $logFile -Destination $archive -Force
+}
 
 Push-Location $scriptDir
 try {

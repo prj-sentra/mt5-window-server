@@ -6,6 +6,7 @@ import hmac
 import functools
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import threading
@@ -58,12 +59,39 @@ def _load_dotenv(path: Path | None = None) -> None:
 
 _load_dotenv()
 
-logging.basicConfig(
-    level=os.getenv("MT5_BRIDGE_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(message)s",
-    stream=sys.stdout,
-)
 LOGGER = logging.getLogger("mt5-bridge-server")
+
+
+def _configure_logging() -> None:
+    level = getattr(logging, os.getenv("MT5_BRIDGE_LOG_LEVEL", "INFO").upper(), logging.INFO)
+    log_path = Path(os.getenv(
+        "MT5_BRIDGE_LOG_FILE",
+        str(Path(__file__).resolve().with_name("logs") / "bridge.log"),
+    ))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s.%(msecs)03dZ %(levelname)s pid=%(process)d thread=%(threadName)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    formatter.converter = time.gmtime
+    LOGGER.setLevel(level)
+    LOGGER.handlers.clear()
+    LOGGER.propagate = False
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=int(os.getenv("MT5_BRIDGE_LOG_MAX_BYTES", str(10 * 1024 * 1024))),
+        backupCount=int(os.getenv("MT5_BRIDGE_LOG_BACKUP_COUNT", "5")),
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(stream)
+    LOGGER.addHandler(file_handler)
+    LOGGER.info("logging initialized file=%s level=%s", log_path, logging.getLevelName(level))
+
+
+_configure_logging()
 
 MT5_LOCK = threading.RLock()
 CURSOR_VERSION = 5
@@ -87,6 +115,7 @@ TICK_CACHE_BYTES = 0
 TICK_CACHE_LOCK = threading.RLock()
 SYNC_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 SYNC_CACHE_LOCK = threading.RLock()
+SUCCESSFUL_ACCOUNT_CREDENTIALS: dict[tuple[str, int], str] = {}
 
 
 class SyncAccountAuthorizationError(RuntimeError):
@@ -534,8 +563,27 @@ def _serialize_order(order: Any) -> dict[str, Any]:
 def _login_for_sync(server: str, account_login: int, password: str) -> None:
     config = _get_config()
     previous = mt5.account_info()
+    previous_login = int(previous.login) if previous is not None else None
+    previous_server = str(previous.server or "") if previous is not None else ""
+    started = time.monotonic()
+    LOGGER.info(
+        "sync login start target_server=%s target_login=%s previous_server=%s previous_login=%s",
+        server, account_login, previous_server or "-", previous_login or "-",
+    )
     if not mt5.initialize(path=config.mt5_terminal):
-        raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
+        first_error = mt5.last_error()
+        LOGGER.warning(
+            "sync initialize failed target_server=%s target_login=%s code=%s; resetting connection",
+            server, account_login, first_error[0],
+        )
+        mt5.shutdown()
+        if not mt5.initialize(path=config.mt5_terminal):
+            error = mt5.last_error()
+            LOGGER.error(
+                "sync initialize recovery failed target_server=%s target_login=%s code=%s elapsed_ms=%d",
+                server, account_login, error[0], int((time.monotonic() - started) * 1000),
+            )
+            raise RuntimeError(f"mt5.initialize() failed: {error}")
     if not mt5.login(login=account_login, password=password, server=server):
         login_error = mt5.last_error()
         # A rejected investor password can leave the shared terminal session
@@ -545,23 +593,42 @@ def _login_for_sync(server: str, account_login: int, password: str) -> None:
         mt5.shutdown()
         restored = mt5.initialize(path=config.mt5_terminal)
         current = mt5.account_info() if restored else None
-        if previous is not None and (current is None or int(current.login) != int(previous.login)):
-            restored = bool(mt5.login(
-                login=int(previous.login),
-                server=str(previous.server or ""),
-            ))
+        if previous_login is not None and (current is None or int(current.login) != previous_login):
+            restore_password = SUCCESSFUL_ACCOUNT_CREDENTIALS.get((previous_server, previous_login))
+            restore_arguments = {"login": previous_login, "server": previous_server}
+            if restore_password is not None:
+                restore_arguments["password"] = restore_password
+            restored = bool(mt5.login(**restore_arguments))
             current = mt5.account_info() if restored else None
-        if previous is not None and (current is None or int(current.login) != int(previous.login)):
+        restored_login = int(current.login) if current is not None else None
+        if previous_login is not None and restored_login != previous_login:
             LOGGER.error(
-                "failed to restore MT5 account %s after rejected login for %s: %s",
-                previous.login, account_login, mt5.last_error(),
+                "sync login rejected and previous session restore failed target_server=%s target_login=%s code=%s previous_server=%s previous_login=%s restored_login=%s elapsed_ms=%d",
+                server, account_login, login_error[0], previous_server, previous_login,
+                restored_login or "-", int((time.monotonic() - started) * 1000),
+            )
+        else:
+            LOGGER.warning(
+                "sync login rejected but previous session restored target_server=%s target_login=%s code=%s restored_login=%s elapsed_ms=%d",
+                server, account_login, login_error[0], restored_login or "-",
+                int((time.monotonic() - started) * 1000),
             )
         raise SyncAccountAuthorizationError(
             f"sync_account_authorization_failed: {login_error[0]}"
         )
     account = mt5.account_info()
     if account is None or int(account.login) != account_login:
+        LOGGER.error(
+            "sync login identity mismatch target_server=%s target_login=%s actual_login=%s elapsed_ms=%d",
+            server, account_login, int(account.login) if account is not None else "-",
+            int((time.monotonic() - started) * 1000),
+        )
         raise RuntimeError("MT5 logged into an unexpected account")
+    SUCCESSFUL_ACCOUNT_CREDENTIALS[(server, account_login)] = password
+    LOGGER.info(
+        "sync login succeeded target_server=%s target_login=%s elapsed_ms=%d",
+        server, account_login, int((time.monotonic() - started) * 1000),
+    )
 
 
 def _ensure_connected() -> None:
@@ -575,6 +642,10 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
     server_version = "Mt5Bridge/5.0"
 
     def do_GET(self) -> None:  # noqa: N802
+        self.request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+        remote = getattr(self, "client_address", ("-",))[0]
+        LOGGER.info("request start id=%s method=GET path=%s remote=%s", self.request_id, self.path, remote)
         try:
             if not self._require_auth():
                 return
@@ -589,10 +660,19 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except Exception as exc:  # pragma: no cover - exercised by manual runtime
-            LOGGER.exception("GET %s failed", self.path)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            LOGGER.exception("request failed id=%s method=GET path=%s", self.request_id, self.path)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_server_error"})
+        finally:
+            LOGGER.info(
+                "request end id=%s method=GET path=%s elapsed_ms=%d",
+                self.request_id, self.path, int((time.monotonic() - started) * 1000),
+            )
 
     def do_POST(self) -> None:  # noqa: N802
+        self.request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+        remote = getattr(self, "client_address", ("-",))[0]
+        LOGGER.info("request start id=%s method=POST path=%s remote=%s", self.request_id, self.path, remote)
         try:
             if not self._require_auth():
                 return
@@ -613,10 +693,10 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            LOGGER.warning("POST %s rejected: %s", self.path, exc)
+            LOGGER.warning("request rejected id=%s method=POST path=%s error=%s", self.request_id, self.path, exc)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except SyncAccountAuthorizationError as exc:
-            LOGGER.warning("POST %s rejected account credentials: %s", self.path, exc)
+            LOGGER.warning("request account authorization rejected id=%s path=%s error=%s", self.request_id, self.path, exc)
             self._send_json(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 {"error": "sync_account_authorization_failed"},
@@ -624,11 +704,16 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         except RuntimeError as exc:
             error = str(exc)
             status = HTTPStatus.UNPROCESSABLE_ENTITY if error in {"tick_source_limit", "tick_valuation_unsupported"} else HTTPStatus.SERVICE_UNAVAILABLE if error == "tick_snapshot_capacity" else HTTPStatus.INTERNAL_SERVER_ERROR
-            LOGGER.warning("POST %s failed: %s", self.path, error)
+            LOGGER.warning("request runtime failure id=%s method=POST path=%s status=%s error=%s", self.request_id, self.path, status, error)
             self._send_json(status, {"error": error})
         except Exception as exc:  # pragma: no cover - exercised by manual runtime
-            LOGGER.exception("POST %s failed", self.path)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            LOGGER.exception("request failed id=%s method=POST path=%s", self.request_id, self.path)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_server_error"})
+        finally:
+            LOGGER.info(
+                "request end id=%s method=POST path=%s elapsed_ms=%d",
+                self.request_id, self.path, int((time.monotonic() - started) * 1000),
+            )
 
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), format % args)
@@ -638,6 +723,11 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         actual = self.headers.get("Authorization")
         if actual == f"Bearer {expected}":
             return True
+        LOGGER.warning(
+            "request bridge authorization rejected id=%s method=%s path=%s remote=%s",
+            getattr(self, "request_id", "-"), getattr(self, "command", "-"), self.path,
+            getattr(self, "client_address", ("-",))[0],
+        )
         self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         return False
 
@@ -1028,6 +1118,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Request-Id", getattr(self, "request_id", "-"))
         self.end_headers()
         self.wfile.write(body)
 
