@@ -2,7 +2,7 @@ param(
     [string]$TaskName = 'MT5 Bridge Server',
     [string]$User = "$env:USERDOMAIN\$env:USERNAME",
     [ValidateSet('Startup', 'Logon')]
-    [string]$Mode = 'Startup'
+    [string]$Mode = 'Logon'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +18,12 @@ if (-not (Test-Path -LiteralPath $launcher)) {
 if (-not (Test-Path -LiteralPath $envFile)) {
     throw "Missing .env file: $envFile"
 }
+
+# Reinstalling the task must not leave an orphan bridge competing for the port.
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -like "*$serverScript*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 $action = New-ScheduledTaskAction `
     -Execute 'powershell.exe' `
@@ -66,7 +72,7 @@ if ($Mode -eq 'Startup') {
 
     Register-ScheduledTask `
         -TaskName $TaskName `
-        -Description 'Starts the MT5 bridge server when the user signs in.' `
+        -Description 'Starts and supervises the MT5 bridge in the interactive MT5 terminal session.' `
         -Action $action `
         -Trigger $trigger `
         -Settings $settings `
