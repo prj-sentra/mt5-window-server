@@ -1000,7 +1000,6 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     config = _get_config()
-    _initialize_mt5(config)
     server = ThreadingHTTPServer((config.bridge_host, config.bridge_port), Mt5BridgeHandler)
     LOGGER.info(
         "listening on %s:%s from=%s",
@@ -1008,6 +1007,13 @@ def main() -> None:
         config.bridge_port,
         config.mt5_initial_from.isoformat(),
     )
+    try:
+        _initialize_mt5(config)
+    except RuntimeError as exc:
+        # The terminal can still be starting or restoring its login session at
+        # Windows boot. Keep the HTTP process alive: health requests report the
+        # connection error and later requests retry initialization.
+        LOGGER.warning("initial MT5 connection unavailable; requests will retry: %s", exc)
     try:
         server.serve_forever()
     finally:

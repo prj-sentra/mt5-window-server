@@ -32,11 +32,17 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 Push-Location $scriptDir
 try {
-    Write-BridgeLog "Starting MT5 bridge with $venvPython $serverScript"
-    & $venvPython $serverScript *>> $logFile
-    $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
-    Write-BridgeLog "MT5 bridge exited with code $exitCode"
-    exit $exitCode
+    while ($true) {
+        Write-BridgeLog "Starting MT5 bridge with $venvPython $serverScript"
+        try {
+            & $venvPython $serverScript *>> $logFile
+            $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+            Write-BridgeLog "MT5 bridge exited with code $exitCode; restarting in 15 seconds"
+        } catch {
+            Write-BridgeLog "MT5 bridge process failed: $($_ | Out-String); restarting in 15 seconds"
+        }
+        Start-Sleep -Seconds 15
+    }
 } catch {
     Write-BridgeLog "MT5 bridge failed: $($_ | Out-String)"
     throw

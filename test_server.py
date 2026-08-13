@@ -116,6 +116,20 @@ class BridgeV5Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid or expired cursor"):
             server._decode_cursor(cursor[:-1] + "A", token="secret", mode="incremental", server="Broker-Server", account_login=1, snapshot_to_msc=10000, changed_since_msc=100, open_position_ids=("7", "8"))
 
+    def test_main_keeps_listener_alive_when_terminal_auth_is_temporarily_unavailable(self):
+        http = mock.Mock()
+        with (
+            mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(
+                bridge_host="127.0.0.1", bridge_port=18813,
+                mt5_initial_from=server.datetime(2020, 1, 1, tzinfo=server.UTC),
+            )),
+            mock.patch.object(server, "_initialize_mt5", side_effect=RuntimeError("authorization failed")),
+            mock.patch.object(server, "ThreadingHTTPServer", return_value=http),
+            mock.patch.object(server.mt5, "shutdown", create=True),
+        ):
+            server.main()
+        http.serve_forever.assert_called_once()
+
     def test_incremental_open_ids_are_canonical_and_validated(self):
         self.assertEqual(server._positive_id_strings(["10", "2"]), ("2", "10"))
         for value in (None, ["0"], ["01"], ["1", "1"], [1]):
