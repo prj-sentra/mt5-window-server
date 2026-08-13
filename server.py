@@ -141,6 +141,9 @@ SUPPORTED_CALCULATION_MODE_NAMES = tuple(mode for _, _, mode in SUPPORTED_CALCUL
 @dataclass(frozen=True, slots=True)
 class BridgeConfig:
     mt5_terminal: str
+    mt5_server: str
+    mt5_login: int
+    mt5_password: str
     mt5_initial_from: datetime
     bridge_host: str
     bridge_port: int
@@ -361,6 +364,9 @@ def _require_env(name: str) -> str:
 def _get_config() -> BridgeConfig:
     return BridgeConfig(
         mt5_terminal=_require_env("MT5_TERMINAL"),
+        mt5_server=_require_env("MT5_SERVER"),
+        mt5_login=int(_require_env("MT5_LOGIN")),
+        mt5_password=_require_env("MT5_PASSWORD"),
         mt5_initial_from=_parse_iso8601(_require_env("MT5_INITIAL_FROM")),
         bridge_host=_require_env("BRIDGE_HOST"),
         bridge_port=int(_require_env("BRIDGE_PORT")),
@@ -370,7 +376,12 @@ def _get_config() -> BridgeConfig:
 
 def _initialize_mt5(config: BridgeConfig | None = None) -> None:
     current = config or _get_config()
-    if mt5.initialize(path=current.mt5_terminal):
+    if mt5.initialize(
+        path=current.mt5_terminal,
+        login=current.mt5_login,
+        password=current.mt5_password,
+        server=current.mt5_server,
+    ):
         return
     raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
 
@@ -572,14 +583,20 @@ def _login_for_sync(server: str, account_login: int, password: str) -> None:
         "sync login start target_server=%s target_login=%s previous_server=%s previous_login=%s",
         server, account_login, previous_server or "-", previous_login or "-",
     )
-    if not mt5.initialize(path=config.mt5_terminal):
+    baseline = {
+        "path": config.mt5_terminal,
+        "login": config.mt5_login,
+        "password": config.mt5_password,
+        "server": config.mt5_server,
+    }
+    if not mt5.initialize(**baseline):
         first_error = mt5.last_error()
         LOGGER.warning(
             "sync initialize failed target_server=%s target_login=%s code=%s; resetting connection",
             server, account_login, first_error[0],
         )
         mt5.shutdown()
-        if not mt5.initialize(path=config.mt5_terminal):
+        if not mt5.initialize(**baseline):
             error = mt5.last_error()
             LOGGER.error(
                 "sync initialize recovery failed target_server=%s target_login=%s code=%s elapsed_ms=%d",
@@ -589,29 +606,21 @@ def _login_for_sync(server: str, account_login: int, password: str) -> None:
     if not mt5.login(login=account_login, password=password, server=server):
         login_error = mt5.last_error()
         # A rejected investor password can leave the shared terminal session
-        # unauthorized. Recover the previously authenticated account using the
-        # terminal's saved credentials so one bad account cannot take down all
-        # subsequent syncs.
+        # unauthorized. Restore the configured baseline account using explicit
+        # credentials; terminal-saved state is not reliable here.
         mt5.shutdown()
-        restored = mt5.initialize(path=config.mt5_terminal)
+        restored = mt5.initialize(**baseline)
         current = mt5.account_info() if restored else None
-        if previous_login is not None and (current is None or int(current.login) != previous_login):
-            restore_password = SUCCESSFUL_ACCOUNT_CREDENTIALS.get((previous_server, previous_login))
-            restore_arguments = {"login": previous_login, "server": previous_server}
-            if restore_password is not None:
-                restore_arguments["password"] = restore_password
-            restored = bool(mt5.login(**restore_arguments))
-            current = mt5.account_info() if restored else None
         restored_login = int(current.login) if current is not None else None
-        if previous_login is not None and restored_login != previous_login:
+        if restored_login != config.mt5_login:
             LOGGER.error(
-                "sync login rejected and previous session restore failed target_server=%s target_login=%s code=%s previous_server=%s previous_login=%s restored_login=%s elapsed_ms=%d",
-                server, account_login, login_error[0], previous_server, previous_login,
+                "sync login rejected and baseline session restore failed target_server=%s target_login=%s code=%s baseline_server=%s baseline_login=%s restored_login=%s elapsed_ms=%d",
+                server, account_login, login_error[0], config.mt5_server, config.mt5_login,
                 restored_login or "-", int((time.monotonic() - started) * 1000),
             )
         else:
             LOGGER.warning(
-                "sync login rejected but previous session restored target_server=%s target_login=%s code=%s restored_login=%s elapsed_ms=%d",
+                "sync login rejected but baseline session restored target_server=%s target_login=%s code=%s restored_login=%s elapsed_ms=%d",
                 server, account_login, login_error[0], restored_login or "-",
                 int((time.monotonic() - started) * 1000),
             )

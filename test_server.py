@@ -130,14 +130,17 @@ class BridgeV5Tests(unittest.TestCase):
             server.main()
         http.serve_forever.assert_called_once()
 
-    def test_rejected_account_password_restores_previous_terminal_session(self):
+    def test_rejected_account_password_restores_configured_baseline_session(self):
         previous = types.SimpleNamespace(login=391597374, server="XMGlobal-MT5 14")
         restored = types.SimpleNamespace(login=391597374, server="XMGlobal-MT5 14")
         with (
-            mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(mt5_terminal="terminal.exe")),
-            mock.patch.object(server.mt5, "account_info", side_effect=[previous, None, restored], create=True),
+            mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(
+                mt5_terminal="terminal.exe", mt5_server="XMGlobal-MT5 14",
+                mt5_login=391597374, mt5_password="baseline-password",
+            )),
+            mock.patch.object(server.mt5, "account_info", side_effect=[previous, restored], create=True),
             mock.patch.object(server.mt5, "initialize", return_value=True, create=True) as initialize,
-            mock.patch.object(server.mt5, "login", side_effect=[False, True], create=True) as login,
+            mock.patch.object(server.mt5, "login", return_value=False, create=True) as login,
             mock.patch.object(server.mt5, "last_error", return_value=(-6, "Authorization failed"), create=True),
             mock.patch.object(server.mt5, "shutdown", create=True) as shutdown,
         ):
@@ -145,10 +148,11 @@ class BridgeV5Tests(unittest.TestCase):
                 server._login_for_sync("XMGlobal-MT5 16", 410304608, "wrong-password")
         shutdown.assert_called_once()
         self.assertEqual(initialize.call_count, 2)
-        self.assertEqual(login.call_args_list, [
-            mock.call(login=410304608, password="wrong-password", server="XMGlobal-MT5 16"),
-            mock.call(login=391597374, server="XMGlobal-MT5 14"),
-        ])
+        initialize.assert_has_calls([mock.call(
+            path="terminal.exe", login=391597374,
+            password="baseline-password", server="XMGlobal-MT5 14",
+        )] * 2)
+        login.assert_called_once_with(login=410304608, password="wrong-password", server="XMGlobal-MT5 16")
 
     def test_sync_authorization_error_is_a_bounded_422_response(self):
         handler = object.__new__(server.Mt5BridgeHandler)
@@ -199,11 +203,12 @@ class BridgeV5Tests(unittest.TestCase):
     def test_incremental_requires_watermark_and_ids(self):
         handler = object.__new__(server.Mt5BridgeHandler)
         handler._read_json_body = lambda: self.request(mode="incremental")
-        with self.assertRaisesRegex(ValueError, "changedSinceMsc"):
-            handler._handle_sync()
-        handler._read_json_body = lambda: self.request(changedSinceMsc=1, openPositionIds=["1"], mode="bootstrap")
-        with self.assertRaisesRegex(ValueError, "incremental-only"):
-            handler._handle_sync()
+        with mock.patch.object(server, "_get_config", return_value=types.SimpleNamespace(bridge_token="test-token")):
+            with self.assertRaisesRegex(ValueError, "changedSinceMsc"):
+                handler._handle_sync()
+            handler._read_json_body = lambda: self.request(changedSinceMsc=1, openPositionIds=["1"], mode="bootstrap")
+            with self.assertRaisesRegex(ValueError, "incremental-only"):
+                handler._handle_sync()
 
     def test_bootstrap_pages_complete_large_payload_without_gaps_or_duplicates(self):
         comment = "x" * 4096
