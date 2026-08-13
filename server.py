@@ -69,6 +69,9 @@ MT5_LOCK = threading.RLock()
 CURSOR_VERSION = 5
 SYNC_RESPONSE_TARGET_BYTES = 768 * 1024
 SYNC_RESPONSE_MAX_BYTES = 1024 * 1024
+SYNC_PAGE_MAX_ITEMS = 100
+SYNC_SNAPSHOT_TTL_SECONDS = 300
+SYNC_CACHE_MAX_ENTRIES = 8
 TICK_RESPONSE_MAX_BYTES = 900_000
 TICK_MAX_CHUNK_MSC = 300_000
 TICK_MAX_PAGE_SIZE = 1_000
@@ -80,6 +83,8 @@ TICK_CURSOR_NAMESPACE = "ticks-v1"
 TICK_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TICK_CACHE_BYTES = 0
 TICK_CACHE_LOCK = threading.RLock()
+SYNC_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+SYNC_CACHE_LOCK = threading.RLock()
 SUPPORTED_CALCULATION_MODES = (
     ("SYMBOL_CALC_MODE_FOREX", 0, "FOREX"),
     ("SYMBOL_CALC_MODE_FUTURES", 2, "FUTURES"),
@@ -357,8 +362,8 @@ def _encode_cursor(
     server: str,
     account_login: int,
     snapshot_to_msc: int,
-    deal_key: tuple[int, int] | None,
-    order_key: tuple[int, int] | None,
+    snapshot_id: str,
+    next_offset: int,
     changed_since_msc: int | None,
     open_position_ids: tuple[str, ...],
 ) -> str:
@@ -369,8 +374,8 @@ def _encode_cursor(
             "s": server,
             "a": account_login,
             "t": snapshot_to_msc,
-            "d": deal_key,
-            "o": order_key,
+            "i": snapshot_id,
+            "n": next_offset,
             "c": changed_since_msc,
             "p": open_position_ids,
         },
@@ -391,9 +396,9 @@ def _decode_cursor(
     snapshot_to_msc: int,
     changed_since_msc: int | None,
     open_position_ids: tuple[str, ...],
-) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+) -> tuple[dict[str, Any], int] | None:
     if raw in {None, ""}:
-        return None, None
+        return None
     if not isinstance(raw, str):
         raise ValueError("'pageCursor' must be an opaque string")
     try:
@@ -414,19 +419,26 @@ def _decode_cursor(
             or decoded.get("p") != list(open_position_ids)
         ):
             raise ValueError
-        keys: list[tuple[int, int] | None] = []
-        for key in (decoded.get("d"), decoded.get("o")):
-            if key is None:
-                keys.append(None)
-                continue
-            if (
-                not isinstance(key, list)
-                or len(key) != 2
-                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in key)
-            ):
+        snapshot_id, next_offset = decoded.get("i"), decoded.get("n")
+        if not isinstance(snapshot_id, str) or not snapshot_id or not isinstance(next_offset, int) or isinstance(next_offset, bool) or next_offset < 0:
+            raise ValueError
+        now_msc = int(time.time() * 1_000)
+        with SYNC_CACHE_LOCK:
+            for expired_id in [key for key, value in SYNC_CACHE.items() if value["expiresAtMsc"] <= now_msc]:
+                del SYNC_CACHE[expired_id]
+            snapshot = SYNC_CACHE.get(snapshot_id)
+            if snapshot is None or snapshot["expiresAtMsc"] <= now_msc:
                 raise ValueError
-            keys.append((key[0], key[1]))
-        return keys[0], keys[1]
+            if any(snapshot[key] != expected_value for key, expected_value in (
+                ("server", server), ("accountLogin", account_login), ("mode", mode),
+                ("snapshotToMsc", snapshot_to_msc), ("changedSinceMsc", changed_since_msc),
+                ("openPositionIds", open_position_ids),
+            )):
+                raise ValueError
+            if next_offset > len(snapshot["items"]):
+                raise ValueError
+            SYNC_CACHE.move_to_end(snapshot_id)
+        return snapshot, next_offset
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ValueError("invalid or expired cursor") from exc
 
@@ -836,7 +848,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             if changed_since_msc > snapshot_to_msc:
                 raise ValueError("'changedSinceMsc' must not exceed 'snapshotToMsc'")
             open_position_ids = _positive_id_strings(payload.get("openPositionIds"))
-        previous_deal_key, previous_order_key = _decode_cursor(
+        continuation = _decode_cursor(
             payload.get("pageCursor"),
             token=config.bridge_token,
             mode=mode,
@@ -846,63 +858,73 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             changed_since_msc=changed_since_msc,
             open_position_ids=open_position_ids,
         )
-        with MT5_LOCK:
-            _login_for_sync(server, account_login, password)
-            history_from = (
-                datetime(1970, 1, 1, tzinfo=UTC)
-                if mode == "bootstrap"
-                else _history_datetime(changed_since_msc, "changedSinceMsc", allow_zero=True)
-            )
-            all_deals_result = mt5.history_deals_get(history_from, snapshot_to)
-            all_orders_result = mt5.history_orders_get(history_from, snapshot_to)
-            if all_deals_result is None:
-                raise RuntimeError(f"mt5.history_deals_get() failed: {mt5.last_error()}")
-            if all_orders_result is None:
-                raise RuntimeError(f"mt5.history_orders_get() failed: {mt5.last_error()}")
-            all_deals = list(all_deals_result)
-            all_orders = list(all_orders_result)
-            for position_id in open_position_ids:
-                position_deals = mt5.history_deals_get(position=int(position_id))
-                position_orders = mt5.history_orders_get(position=int(position_id))
-                if position_deals is None:
-                    raise RuntimeError(f"mt5.history_deals_get(position) failed: {mt5.last_error()}")
-                if position_orders is None:
-                    raise RuntimeError(f"mt5.history_orders_get(position) failed: {mt5.last_error()}")
-                all_deals.extend(deal for deal in position_deals if int(deal.time_msc) <= snapshot_to_msc)
-                all_orders.extend(order for order in position_orders if _order_key(order)[0] <= snapshot_to_msc)
-            account = mt5.account_info()
-            if account is None:
-                raise RuntimeError(f"mt5.account_info() failed: {mt5.last_error()}")
-
-            deals = _dedupe_sorted(all_deals, _deal_key)
-            orders = _dedupe_sorted(all_orders, _order_key)
+        if continuation is None:
+            with MT5_LOCK:
+                _login_for_sync(server, account_login, password)
+                history_from = (
+                    datetime(1970, 1, 1, tzinfo=UTC)
+                    if mode == "bootstrap"
+                    else _history_datetime(changed_since_msc, "changedSinceMsc", allow_zero=True)
+                )
+                all_deals_result = mt5.history_deals_get(history_from, snapshot_to)
+                all_orders_result = mt5.history_orders_get(history_from, snapshot_to)
+                if all_deals_result is None:
+                    raise RuntimeError(f"mt5.history_deals_get() failed: {mt5.last_error()}")
+                if all_orders_result is None:
+                    raise RuntimeError(f"mt5.history_orders_get() failed: {mt5.last_error()}")
+                all_deals = list(all_deals_result)
+                all_orders = list(all_orders_result)
+                for position_id in open_position_ids:
+                    position_deals = mt5.history_deals_get(position=int(position_id))
+                    position_orders = mt5.history_orders_get(position=int(position_id))
+                    if position_deals is None:
+                        raise RuntimeError(f"mt5.history_deals_get(position) failed: {mt5.last_error()}")
+                    if position_orders is None:
+                        raise RuntimeError(f"mt5.history_orders_get(position) failed: {mt5.last_error()}")
+                    all_deals.extend(deal for deal in position_deals if int(deal.time_msc) <= snapshot_to_msc)
+                    all_orders.extend(order for order in position_orders if _order_key(order)[0] <= snapshot_to_msc)
+                account = mt5.account_info()
+                if account is None:
+                    raise RuntimeError(f"mt5.account_info() failed: {mt5.last_error()}")
+                deals = _dedupe_sorted(all_deals, _deal_key)
+                orders = _dedupe_sorted(all_orders, _order_key)
+            items: list[tuple[str, dict[str, Any], tuple[int, int]]] = [
+                *(("deal", _serialize_deal(deal), _deal_key(deal)) for deal in deals),
+                *(("order", _serialize_order(order), _order_key(order)) for order in orders),
+            ]
+            items.sort(key=lambda item: (item[2], item[0]))
+            snapshot = {
+                "id": uuid.uuid4().hex, "server": server, "accountLogin": account_login, "mode": mode,
+                "snapshotToMsc": snapshot_to_msc, "changedSinceMsc": changed_since_msc,
+                "openPositionIds": open_position_ids, "items": items,
+                "account": {
+                    "currency": str(account.currency or ""),
+                    "currentBalance": _canonical_number(account.balance),
+                    "currencyDigits": _currency_digits(account),
+                },
+                "expiresAtMsc": int(time.time() * 1_000) + SYNC_SNAPSHOT_TTL_SECONDS * 1_000,
+            }
+            with SYNC_CACHE_LOCK:
+                while len(SYNC_CACHE) >= SYNC_CACHE_MAX_ENTRIES:
+                    SYNC_CACHE.popitem(last=False)
+                SYNC_CACHE[snapshot["id"]] = snapshot
+            offset = 0
+        else:
+            snapshot, offset = continuation
 
         response_base = {
-            "contractVersion": CURSOR_VERSION,
-            "server": server,
-            "accountLogin": account_login,
-            "mode": mode,
-            "snapshotToMsc": snapshot_to_msc,
-            "account": {
-                "currency": str(account.currency or ""),
-                "currentBalance": _canonical_number(account.balance),
-                "currencyDigits": _currency_digits(account),
-            },
+            "contractVersion": CURSOR_VERSION, "server": server, "accountLogin": account_login,
+            "mode": mode, "snapshotToMsc": snapshot_to_msc, "account": snapshot["account"],
         }
         selected_deals: list[dict[str, Any]] = []
         selected_orders: list[dict[str, Any]] = []
-        remaining: list[tuple[str, Any, tuple[int, int]]] = []
-        remaining.extend(("deal", deal, _deal_key(deal)) for deal in deals if previous_deal_key is None or _deal_key(deal) > previous_deal_key)
-        remaining.extend(("order", order, _order_key(order)) for order in orders if previous_order_key is None or _order_key(order) > previous_order_key)
-        remaining.sort(key=lambda item: (item[2], item[0]))
-        last_deal_key, last_order_key = previous_deal_key, previous_order_key
 
-        def response_for_page(has_more: bool) -> dict[str, Any]:
+        def response_for_page(has_more: bool, next_offset: int) -> dict[str, Any]:
             page: dict[str, Any] = {"hasMore": has_more, "bytes": 0}
             if has_more:
                 page["nextCursor"] = _encode_cursor(
                     token=config.bridge_token, mode=mode, server=server, account_login=account_login,
-                    snapshot_to_msc=snapshot_to_msc, deal_key=last_deal_key, order_key=last_order_key,
+                    snapshot_to_msc=snapshot_to_msc, snapshot_id=snapshot["id"], next_offset=next_offset,
                     changed_since_msc=changed_since_msc, open_position_ids=open_position_ids,
                 )
             response = {**response_base, "page": page, "deals": selected_deals, "orders": selected_orders}
@@ -913,29 +935,28 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 response["page"]["bytes"] = size
 
         consumed = 0
-        for stream, fact, key in remaining:
+        for stream, fact, _key in snapshot["items"][offset:]:
+            if consumed >= SYNC_PAGE_MAX_ITEMS:
+                break
             target = selected_deals if stream == "deal" else selected_orders
-            target.append(_serialize_deal(fact) if stream == "deal" else _serialize_order(fact))
-            old_deal_key, old_order_key = last_deal_key, last_order_key
-            if stream == "deal":
-                last_deal_key = key
-            else:
-                last_order_key = key
-            if len(_compact_json(response_for_page(consumed + 1 < len(remaining)))) > SYNC_RESPONSE_TARGET_BYTES:
+            target.append(fact)
+            next_offset = offset + consumed + 1
+            if len(_compact_json(response_for_page(next_offset < len(snapshot["items"]), next_offset))) > SYNC_RESPONSE_TARGET_BYTES:
                 target.pop()
-                last_deal_key, last_order_key = old_deal_key, old_order_key
                 if consumed == 0:
-                    target.append(_serialize_deal(fact) if stream == "deal" else _serialize_order(fact))
-                    last_deal_key = key if stream == "deal" else last_deal_key
-                    last_order_key = key if stream == "order" else last_order_key
+                    target.append(fact)
                     consumed = 1
                 break
             consumed += 1
-        has_more = consumed < len(remaining)
-        response = response_for_page(has_more)
+        next_offset = offset + consumed
+        has_more = next_offset < len(snapshot["items"])
+        response = response_for_page(has_more, next_offset)
         if len(_compact_json(response)) >= SYNC_RESPONSE_MAX_BYTES:
             raise RuntimeError("bridge v5 response exceeds 1 MiB")
         self._send_json(HTTPStatus.OK, response)
+        if not has_more:
+            with SYNC_CACHE_LOCK:
+                SYNC_CACHE.pop(snapshot["id"], None)
     def _handle_profit_calc(self) -> None:
         _ensure_connected()
         payload = self._read_json_body()

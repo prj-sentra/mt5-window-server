@@ -27,8 +27,16 @@ class BridgeV5Tests(unittest.TestCase):
                 "password": "password", "mode": "bootstrap", "snapshotToMsc": 10000, **extra}
 
     def cursor(self, **extra):
+        snapshot = {
+            "id": "sync-snapshot", "server": "Broker-Server", "accountLogin": 1,
+            "mode": "incremental", "snapshotToMsc": 10000, "changedSinceMsc": 100,
+            "openPositionIds": ("7", "8"), "items": [("deal", {}, (2, 3))],
+            "account": {}, "expiresAtMsc": int(server.time.time() * 1000) + 60000,
+        }
+        server.SYNC_CACHE.clear()
+        server.SYNC_CACHE[snapshot["id"]] = snapshot
         return server._encode_cursor(token="secret", mode="incremental", server="Broker-Server",
-            account_login=1, snapshot_to_msc=10000, deal_key=(2, 3), order_key=(4, 5),
+            account_login=1, snapshot_to_msc=10000, snapshot_id=snapshot["id"], next_offset=1,
             changed_since_msc=100, open_position_ids=("7", "8"), **extra)
 
 
@@ -101,7 +109,8 @@ class BridgeV5Tests(unittest.TestCase):
 
     def test_cursor_is_signed_request_bound_and_opaque(self):
         cursor = self.cursor()
-        self.assertEqual(server._decode_cursor(cursor, token="secret", mode="incremental", server="Broker-Server", account_login=1, snapshot_to_msc=10000, changed_since_msc=100, open_position_ids=("7", "8")), ((2, 3), (4, 5)))
+        snapshot, offset = server._decode_cursor(cursor, token="secret", mode="incremental", server="Broker-Server", account_login=1, snapshot_to_msc=10000, changed_since_msc=100, open_position_ids=("7", "8"))
+        self.assertEqual((snapshot["id"], offset), ("sync-snapshot", 1))
         with self.assertRaisesRegex(ValueError, "invalid or expired cursor"):
             server._decode_cursor(cursor, token="secret", mode="bootstrap", server="Broker-Server", account_login=1, snapshot_to_msc=10000, changed_since_msc=None, open_position_ids=())
         with self.assertRaisesRegex(ValueError, "invalid or expired cursor"):
@@ -158,11 +167,21 @@ class BridgeV5Tests(unittest.TestCase):
         self.assertEqual(tickets, [str(ticket) for ticket in range(1, 450)])
         self.assertEqual(len(tickets), len(set(tickets)))
         for index, page in enumerate(pages):
+            self.assertLessEqual(len(page["deals"]) + len(page["orders"]), 100)
             self.assertEqual(page["page"]["bytes"], len(server._compact_json(page)))
             self.assertLess(page["page"]["bytes"], 1024 * 1024)
             self.assertLessEqual(page["page"]["bytes"], server.SYNC_RESPONSE_TARGET_BYTES)
             self.assertEqual(page["page"]["hasMore"], index < len(pages) - 1)
             self.assertEqual("nextCursor" in page["page"], index < len(pages) - 1)
+
+    def test_bootstrap_1709_deals_use_fixed_snapshot_pages_of_at_most_100(self):
+        deals = [self.deal(ticket, 1000 + ticket) for ticket in range(1, 1710)]
+        pages = self.sync_pages(self.request(), deals, [])
+        self.assertEqual(len(pages), 18)
+        self.assertEqual(sum(len(page["deals"]) for page in pages), 1709)
+        self.assertTrue(all(len(page["deals"]) + len(page["orders"]) <= 100 for page in pages))
+        self.assertEqual({page["snapshotToMsc"] for page in pages}, {10000})
+        self.assertTrue(all(page["page"]["bytes"] == len(server._compact_json(page)) for page in pages))
 
     def test_cursor_continuation_preserves_equal_time_ticket_boundaries(self):
         comment = "x" * 8192
@@ -280,7 +299,7 @@ class BridgeV5Tests(unittest.TestCase):
             server._decode_tick_cursor(
                 server._encode_cursor(
                     token="test-token", mode="bootstrap", server="Broker-Server",
-                    account_login=1, snapshot_to_msc=3000, deal_key=None, order_key=None,
+                    account_login=1, snapshot_to_msc=3000, snapshot_id="sync-snapshot", next_offset=0,
                     changed_since_msc=None, open_position_ids=(),
                 ),
                 "test-token",
