@@ -70,7 +70,9 @@ CURSOR_VERSION = 5
 SYNC_RESPONSE_TARGET_BYTES = 768 * 1024
 SYNC_RESPONSE_MAX_BYTES = 1024 * 1024
 SYNC_PAGE_MAX_ITEMS = 100
-SYNC_SNAPSHOT_TTL_SECONDS = 300
+# Large accounts can require hundreds of durable API page commits. Keep the
+# immutable bridge snapshot long enough to survive that bounded processing.
+SYNC_SNAPSHOT_TTL_SECONDS = 3600
 SYNC_CACHE_MAX_ENTRIES = 8
 TICK_RESPONSE_MAX_BYTES = 900_000
 TICK_MAX_CHUNK_MSC = 300_000
