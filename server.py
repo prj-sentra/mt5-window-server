@@ -566,7 +566,9 @@ def _login_for_sync(server: str, account_login: int, password: str) -> None:
     previous_login = int(previous.login) if previous is not None else None
     previous_server = str(previous.server or "") if previous is not None else ""
     started = time.monotonic()
-    LOGGER.info(
+    switching_account = previous_login != account_login or previous_server != server
+    login_logger = LOGGER.info if switching_account else LOGGER.debug
+    login_logger(
         "sync login start target_server=%s target_login=%s previous_server=%s previous_login=%s",
         server, account_login, previous_server or "-", previous_login or "-",
     )
@@ -625,7 +627,7 @@ def _login_for_sync(server: str, account_login: int, password: str) -> None:
         )
         raise RuntimeError("MT5 logged into an unexpected account")
     SUCCESSFUL_ACCOUNT_CREDENTIALS[(server, account_login)] = password
-    LOGGER.info(
+    login_logger(
         "sync login succeeded target_server=%s target_login=%s elapsed_ms=%d",
         server, account_login, int((time.monotonic() - started) * 1000),
     )
@@ -645,7 +647,8 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         self.request_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
         remote = getattr(self, "client_address", ("-",))[0]
-        LOGGER.info("request start id=%s method=GET path=%s remote=%s", self.request_id, self.path, remote)
+        request_logger = LOGGER.debug if self.path in {"/health", "/capabilities"} else LOGGER.info
+        request_logger("request start id=%s method=GET path=%s remote=%s", self.request_id, self.path, remote)
         try:
             if not self._require_auth():
                 return
@@ -663,7 +666,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             LOGGER.exception("request failed id=%s method=GET path=%s", self.request_id, self.path)
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_server_error"})
         finally:
-            LOGGER.info(
+            request_logger(
                 "request end id=%s method=GET path=%s elapsed_ms=%d",
                 self.request_id, self.path, int((time.monotonic() - started) * 1000),
             )
@@ -672,7 +675,8 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
         self.request_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
         remote = getattr(self, "client_address", ("-",))[0]
-        LOGGER.info("request start id=%s method=POST path=%s remote=%s", self.request_id, self.path, remote)
+        request_logger = LOGGER.debug if self.path == "/ticks" else LOGGER.info
+        request_logger("request start id=%s method=POST path=%s remote=%s", self.request_id, self.path, remote)
         try:
             if not self._require_auth():
                 return
@@ -710,13 +714,16 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
             LOGGER.exception("request failed id=%s method=POST path=%s", self.request_id, self.path)
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_server_error"})
         finally:
-            LOGGER.info(
+            request_logger(
                 "request end id=%s method=POST path=%s elapsed_ms=%d",
                 self.request_id, self.path, int((time.monotonic() - started) * 1000),
             )
 
     def log_message(self, format: str, *args: Any) -> None:
-        LOGGER.info("%s - %s", self.address_string(), format % args)
+        if self.path in {"/health", "/capabilities", "/ticks"}:
+            LOGGER.debug("%s - %s", self.address_string(), format % args)
+        else:
+            LOGGER.info("%s - %s", self.address_string(), format % args)
 
     def _require_auth(self) -> bool:
         expected = _get_config().bridge_token
