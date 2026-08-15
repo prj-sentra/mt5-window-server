@@ -229,9 +229,10 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
     if not account_currency or not profit_currency:
         raise RuntimeError("tick_valuation_unsupported")
     tick_size = _canonical_positive_number(getattr(info, "trade_tick_size", None), "tickSize")
+    point_size = _canonical_positive_number(getattr(info, "point", None), "pointSize")
     tick_value_profit = _canonical_positive_number(getattr(info, "trade_tick_value_profit", None), "tickValueProfit")
     tick_value_loss = _canonical_positive_number(getattr(info, "trade_tick_value_loss", None), "tickValueLoss")
-    point = Decimal(tick_size)
+    profit_step = Decimal(tick_size)
     current_tick = mt5.symbol_info_tick(symbol)
     reference_value = getattr(current_tick, "last", 0) or getattr(current_tick, "bid", 0) or getattr(current_tick, "ask", 0)
     reference = Decimal(str(reference_value))
@@ -242,7 +243,7 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
         (getattr(mt5, "ORDER_TYPE_SELL", 1), Decimal(-1)),
     ):
         for signed_step in (Decimal(1), Decimal(-1)):
-            close = reference + direction * signed_step * point
+            close = reference + direction * signed_step * profit_step
             observed = mt5.order_calc_profit(order_type, symbol, 1.0, float(reference), float(close))
             if observed is None:
                 raise RuntimeError("tick_valuation_unsupported")
@@ -252,13 +253,14 @@ def _symbol_valuation(symbol: str, account: Any) -> dict[str, Any]:
             if abs(Decimal(str(observed)) - expected) > tolerance:
                 raise RuntimeError("tick_valuation_unsupported")
     values = {
-        "version": 1, "calculationMode": calculation_mode,
+        "version": 2, "calculationMode": calculation_mode,
         "accountCurrency": account_currency, "profitCurrency": profit_currency,
-        "tickSize": tick_size, "tickValueProfit": tick_value_profit, "tickValueLoss": tick_value_loss,
+        "pointSize": point_size, "tickSize": tick_size,
+        "tickValueProfit": tick_value_profit, "tickValueLoss": tick_value_loss,
     }
     values["sha256"] = _digest_parts([
-        "ticks-v1-valuation", 1, calculation_mode, account_currency, profit_currency,
-        tick_size, tick_value_profit, tick_value_loss,
+        "ticks-v1-valuation", 2, calculation_mode, account_currency, profit_currency,
+        point_size, tick_size, tick_value_profit, tick_value_loss,
     ])
     return values
 
@@ -790,7 +792,7 @@ class Mt5BridgeHandler(BaseHTTPRequestHandler):
                 "snapshotTtlSeconds": TICK_SNAPSHOT_TTL_SECONDS,
                 "cacheMaxEntries": TICK_CACHE_MAX_ENTRIES,
                 "cacheMaxBytes": TICK_CACHE_MAX_BYTES,
-                "valuationVersion": 1,
+                "valuationVersion": 2,
                 "supportedCalculationModes": list(SUPPORTED_CALCULATION_MODE_NAMES),
             },
         })

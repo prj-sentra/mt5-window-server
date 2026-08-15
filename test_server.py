@@ -297,6 +297,7 @@ class BridgeV5Tests(unittest.TestCase):
         self.assertEqual(status, server.HTTPStatus.OK)
         self.assertEqual(body["contractVersion"], 5)
         self.assertEqual(body["ticks"]["cursorNamespace"], "ticks-v1")
+        self.assertEqual(body["ticks"]["valuationVersion"], 2)
         self.assertEqual(body["ticks"]["maxChunkSpanMsc"], 300000)
         self.assertLess(body["ticks"]["maxResponseBytes"], 1024 * 1024)
         self.assertEqual(body["ticks"]["supportedCalculationModes"], list(server.SUPPORTED_CALCULATION_MODE_NAMES))
@@ -326,7 +327,7 @@ class BridgeV5Tests(unittest.TestCase):
             mock.patch.object(server.mt5, "account_info", return_value=Account(1, 12, "USD", 2), create=True),
             mock.patch.object(server.mt5, "symbol_info_tick", return_value=types.SimpleNamespace(last=1, bid=1, ask=1), create=True),
             mock.patch.object(server.mt5, "symbol_info", return_value=types.SimpleNamespace(
-                trade_calc_mode=0, currency_profit="USD", trade_tick_size=0.01,
+                trade_calc_mode=0, currency_profit="USD", point=0.001, trade_tick_size=0.01,
                 trade_tick_value_profit=1, trade_tick_value_loss=1,
             ), create=True),
             mock.patch.object(
@@ -339,6 +340,9 @@ class BridgeV5Tests(unittest.TestCase):
             handler._handle_ticks()
             first = sent[-1][1]
             self.assertFalse(first["complete"])
+            self.assertEqual(first["valuation"]["version"], 2)
+            self.assertEqual(first["valuation"]["pointSize"], "0.001")
+            self.assertEqual(first["valuation"]["tickSize"], "0.01")
             self.assertEqual([tick["sequence"] for tick in first["ticks"]], [0, 1])
             payload = {"contractVersion": 5, "pageCursor": first["nextCursor"]}
             handler._handle_ticks()
@@ -364,6 +368,31 @@ class BridgeV5Tests(unittest.TestCase):
             server._tick_snapshot_digest(ticks),
             server._tick_snapshot_digest([{**ticks[0], "ask": "102"}]),
         )
+
+    def test_valuation_requires_mt5_point_size_and_binds_it_into_digest(self):
+        def valuation(point):
+            with (
+                mock.patch.object(server.mt5, "SYMBOL_CALC_MODE_FOREX", 0, create=True),
+                mock.patch.object(server.mt5, "symbol_info", return_value=types.SimpleNamespace(
+                    trade_calc_mode=0, currency_profit="USD", point=point, trade_tick_size=0.01,
+                    trade_tick_value_profit=1, trade_tick_value_loss=1,
+                ), create=True),
+                mock.patch.object(server.mt5, "symbol_info_tick", return_value=types.SimpleNamespace(last=1, bid=1, ask=1), create=True),
+                mock.patch.object(
+                    server.mt5, "order_calc_profit",
+                    side_effect=lambda order_type, _symbol, _lots, opened, closed:
+                        (closed - opened) / 0.01 * (1 if order_type == 0 else -1),
+                    create=True,
+                ),
+            ):
+                return server._symbol_valuation("XAUUSD", Account(1, 12, "USD", 2))
+
+        first = valuation(0.001)
+        second = valuation(0.0001)
+        self.assertEqual(first["pointSize"], "0.001")
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        with self.assertRaisesRegex(ValueError, "pointSize"):
+            valuation(0)
 
 if __name__ == "__main__":
     unittest.main()
